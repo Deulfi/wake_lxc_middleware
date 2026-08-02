@@ -133,14 +133,14 @@ WAKE_SECRET="XXX"
 *Note: Update `PROXMOX_HOST`, `PROXMOX_NODE`, and other values to match your setup. Ensure `PROXMOX_TOKEN_VALUE` contains the actual token string.*
 
 ### 5. Configure Traefik & Middleware
-- Add Traefik routing rules to `/etc/traefik/conf.d/pubwake.yaml` (see Traefik Configuration section above).
+- Add Traefik routing rules to `/etc/traefik/conf.d/wakemiddleware.yaml` (see Traefik Configuration section above).
 - Ensure your `config.yaml` is correctly placed in `/opt/wake_lxc_middleware/config.yaml`.
 
 ### 6. Create Systemd Service
-Create a service file at `/etc/systemd/system/pub-wake.service`:
+Create a service file at `/etc/systemd/system/wake-middleware.service`:
 ```ini
 [Unit]
-Description=Pub Wake LXC
+Description=Wake LXC Middleware
 After=network.target
 
 [Service]
