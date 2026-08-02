@@ -147,14 +147,18 @@ def schedule_stop(container: dict):
     logger.info(f"Scheduling stop for container {vmid} in {stop_minutes} minutes.")
     
     async def stop_after_delay():
-        await asyncio.sleep(stop_minutes * 60)
-        logger.info(f"Stop timer fired for container {vmid}. Checking status...")
-        if await check_container_status(vmid, container.get('kind', 'lxc')):
-            logger.info(f"Container {vmid} is still running. Initiating shutdown.")
-            await shutdown_container(vmid, container.get('kind', 'lxc'), container.get('stop_mode', 'shutdown'))
-        else:
-            logger.info(f"Container {vmid} is not running. Skipping shutdown.")
-        active_timers.pop(vmid, None)
+        try:
+            await asyncio.sleep(stop_minutes * 60)
+            logger.info(f"Stop timer fired for container {vmid}. Checking status...")
+            if await check_container_status(vmid, container.get('kind', 'lxc')):
+                logger.info(f"Container {vmid} is still running. Initiating shutdown.")
+                await shutdown_container(vmid, container.get('kind', 'lxc'), container.get('stop_mode', 'shutdown'))
+            else:
+                logger.info(f"Container {vmid} is not running. Skipping shutdown.")
+        except asyncio.CancelledError:
+            logger.info(f"Stop timer for container {vmid} was cancelled.")
+        finally:
+            active_timers.pop(vmid, None)
 
     task = asyncio.create_task(stop_after_delay())
     active_timers[vmid] = task
@@ -167,20 +171,23 @@ def start_watchdog(container: dict):
     
     async def watchdog_loop():
         logger.info(f"Watchdog started for container {vmid}, checking every {check_interval} minutes.")
-        while True:
-            await asyncio.sleep(check_interval_seconds)
-            if vmid not in active_timers:
-                logger.info(f"Watchdog for container {vmid} cancelled (timer finished or removed).")
-                break
-            is_running = await check_container_status(vmid, container.get('kind', 'lxc'))
-            if not is_running:
-                logger.info(f"Container {vmid} is down. Cancelling stop timer.")
-                if vmid in active_timers:
-                    active_timers[vmid].cancel()
-                    active_timers.pop(vmid, None)
-                break
-            else:
-                logger.info(f"Watchdog check for container {vmid}: Running.")
+        try:
+            while True:
+                await asyncio.sleep(check_interval_seconds)
+                if vmid not in active_timers:
+                    logger.info(f"Watchdog for container {vmid} cancelled (timer finished or removed).")
+                    break
+                is_running = await check_container_status(vmid, container.get('kind', 'lxc'))
+                if not is_running:
+                    logger.info(f"Container {vmid} is down. Cancelling stop timer.")
+                    if vmid in active_timers:
+                        active_timers[vmid].cancel()
+                        active_timers.pop(vmid, None)
+                    break
+                else:
+                    logger.info(f"Watchdog check for container {vmid}: Running.")
+        except asyncio.CancelledError:
+            logger.info(f"Watchdog for container {vmid} cancelled.")
 
     task = asyncio.create_task(watchdog_loop())
     watchdog_tasks[vmid] = task
@@ -218,15 +225,17 @@ async def forward_auth(request: Request):
     logger.info(f"Checking status for container {vmid}...")
     is_running = await check_container_status(vmid, container.get('kind', 'lxc'))
     
+    if not is_running:
+        logger.info(f"Container {vmid} is not running. Starting it now.")
+        await start_container(vmid, container.get('kind', 'lxc'))
+    
+    # Always schedule stop timer and watchdog on access, regardless of initial state
+    schedule_stop(container)
+    start_watchdog(container)
+    
     if is_running:
         logger.info(f"Container {vmid} is running. Allowing access.")
         return JSONResponse(status_code=200, content={})
-    
-    # Container not running, start it
-    logger.info(f"Container {vmid} is not running. Starting it now.")
-    await start_container(vmid, container.get('kind', 'lxc'))
-    schedule_stop(container)
-    start_watchdog(container)
     
     # Return HTML page with SSE client to show progress
     html = f"""

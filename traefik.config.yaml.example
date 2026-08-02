@@ -61,5 +61,5 @@ middlewares:
 
   wake-lxc-middleware:
     forwardAuth:
-      address: "http://wake-lxc-middleware:8000/auth"
+      address: "http://wake-lxc:8000/auth"
       trustForwardHeader: true
