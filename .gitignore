@@ -2,3 +2,7 @@
 /asgi_app_original.py
 /logs
 /test_services.py
+.aider*
+.env
+.env
+.env
