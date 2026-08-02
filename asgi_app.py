@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import time
 from typing import Optional, Dict, Any
@@ -7,6 +8,13 @@ import httpx
 import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+
+# Configure logging to stdout (visible in journalctl for systemd, or terminal)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="wake_lxc_middleware")
 
@@ -73,6 +81,7 @@ def reset_container_failures(vmid: str):
 
 async def check_container_status(vmid: str, kind: str = "lxc") -> bool:
     if not check_circuit_breaker(vmid):
+        logger.warning(f"Container {vmid} is in circuit breaker state, skipping status check.")
         return False
     try:
         async with get_proxmox_client() as client:
@@ -82,44 +91,69 @@ async def check_container_status(vmid: str, kind: str = "lxc") -> bool:
                 status = data.get("data", {}).get("status", "")
                 if status == "running":
                     reset_container_failures(vmid)
+                    logger.info(f"Container {vmid} is running.")
                     return True
                 else:
+                    logger.info(f"Container {vmid} is {status}.")
                     record_container_failure(vmid)
                     return False
     except Exception as e:
+        logger.error(f"Failed to check status for container {vmid}: {e}")
         record_container_failure(vmid)
         return False
     return False
 
 async def start_container(vmid: str, kind: str = "lxc") -> bool:
     try:
+        logger.info(f"Starting container {vmid}...")
         async with get_proxmox_client() as client:
             resp = await client.post(f"/api2/json/nodes/{os.getenv('PROXMOX_NODE')}/{kind}/{vmid}/status/start")
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                logger.info(f"Container {vmid} start command sent successfully.")
+                return True
+            else:
+                logger.error(f"Failed to start container {vmid}: {resp.status_code} - {resp.text}")
+                record_container_failure(vmid)
+                return False
     except Exception as e:
+        logger.error(f"Exception while starting container {vmid}: {e}")
         record_container_failure(vmid)
         return False
 
 async def shutdown_container(vmid: str, kind: str = "lxc", stop_mode: str = "shutdown") -> bool:
     try:
+        logger.info(f"Shutting down container {vmid} using mode '{stop_mode}'...")
         async with get_proxmox_client() as client:
             resp = await client.post(f"/api2/json/nodes/{os.getenv('PROXMOX_NODE')}/{kind}/{vmid}/status/{stop_mode}")
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                logger.info(f"Container {vmid} shutdown command sent successfully.")
+                return True
+            else:
+                logger.error(f"Failed to shutdown container {vmid}: {resp.status_code} - {resp.text}")
+                record_container_failure(vmid)
+                return False
     except Exception as e:
+        logger.error(f"Exception while shutting down container {vmid}: {e}")
         record_container_failure(vmid)
         return False
 
 def schedule_stop(container: dict):
     vmid = str(container['vmid'])
     if vmid in active_timers:
+        logger.info(f"Cancelling existing stop timer for container {vmid}.")
         active_timers[vmid].cancel()
     
     stop_minutes = container.get('stop_minutes', config['global']['stop_minutes'])
+    logger.info(f"Scheduling stop for container {vmid} in {stop_minutes} minutes.")
     
     async def stop_after_delay():
         await asyncio.sleep(stop_minutes * 60)
+        logger.info(f"Stop timer fired for container {vmid}. Checking status...")
         if await check_container_status(vmid, container.get('kind', 'lxc')):
+            logger.info(f"Container {vmid} is still running. Initiating shutdown.")
             await shutdown_container(vmid, container.get('kind', 'lxc'), container.get('stop_mode', 'shutdown'))
+        else:
+            logger.info(f"Container {vmid} is not running. Skipping shutdown.")
         active_timers.pop(vmid, None)
 
     task = asyncio.create_task(stop_after_delay())
@@ -128,17 +162,25 @@ def schedule_stop(container: dict):
 def start_watchdog(container: dict):
     vmid = str(container['vmid'])
     check_interval = container.get('check_interval', config['global']['check_interval'])
+    # Convert check_interval from minutes to seconds for asyncio.sleep
+    check_interval_seconds = check_interval * 60
     
     async def watchdog_loop():
+        logger.info(f"Watchdog started for container {vmid}, checking every {check_interval} minutes.")
         while True:
-            await asyncio.sleep(check_interval)
+            await asyncio.sleep(check_interval_seconds)
             if vmid not in active_timers:
+                logger.info(f"Watchdog for container {vmid} cancelled (timer finished or removed).")
                 break
-            if not await check_container_status(vmid, container.get('kind', 'lxc')):
+            is_running = await check_container_status(vmid, container.get('kind', 'lxc'))
+            if not is_running:
+                logger.info(f"Container {vmid} is down. Cancelling stop timer.")
                 if vmid in active_timers:
                     active_timers[vmid].cancel()
                     active_timers.pop(vmid, None)
                 break
+            else:
+                logger.info(f"Watchdog check for container {vmid}: Running.")
 
     task = asyncio.create_task(watchdog_loop())
     watchdog_tasks[vmid] = task
@@ -146,33 +188,42 @@ def start_watchdog(container: dict):
 @app.on_event("startup")
 async def startup_event():
     global config
+    logger.info("Application starting up...")
     config = load_proxmox_config()
     validate_config(config)
+    logger.info("Configuration loaded and validated successfully.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    logger.info("Application shutting down...")
     for task in list(active_timers.values()):
         task.cancel()
     for task in list(watchdog_tasks.values()):
         task.cancel()
+    logger.info("All tasks cancelled. Shutdown complete.")
 
 @app.get("/auth")
 async def forward_auth(request: Request):
     """Traefik ForwardAuth endpoint"""
     host = request.headers.get("host") or request.headers.get("x-forwarded-host", "")
+    logger.info(f"Auth request received for host: {host}")
+    
     container = get_container_by_domain(host)
     
     if not container:
+        logger.warning(f"Container not found for host: {host}")
         return JSONResponse(status_code=404, content={"detail": "Container not found"})
 
     vmid = str(container['vmid'])
+    logger.info(f"Checking status for container {vmid}...")
     is_running = await check_container_status(vmid, container.get('kind', 'lxc'))
     
     if is_running:
-        # Container is up, allow Traefik to proceed
+        logger.info(f"Container {vmid} is running. Allowing access.")
         return JSONResponse(status_code=200, content={})
     
     # Container not running, start it
+    logger.info(f"Container {vmid} is not running. Starting it now.")
     await start_container(vmid, container.get('kind', 'lxc'))
     schedule_stop(container)
     start_watchdog(container)
@@ -208,15 +259,18 @@ async def status_stream(host: str):
     """SSE endpoint for status updates"""
     container = get_container_by_domain(host)
     if not container:
+        logger.warning(f"Status stream requested for unknown host: {host}")
         return StreamingResponse(iter([]), media_type="text/event-stream")
         
     vmid = str(container['vmid'])
+    logger.info(f"Status stream started for container {vmid} (host: {host})")
     
     async def event_generator():
         while True:
             is_running = await check_container_status(vmid, container.get('kind', 'lxc'))
             if is_running:
                 yield f"data: Container is running.\n\n"
+                logger.info(f"Container {vmid} is now running. Closing status stream.")
                 break
             else:
                 yield f"data: Container is starting...\n\n"
