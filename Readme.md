@@ -20,8 +20,8 @@
 
 ### 1. Clone & Setup
 ```bash
-git clone https://github.com/itsddpanda/pub_wake_lxc.git
-cd pub_wake_lxc
+git clone https://github.com/Deulfi/wake_lxc_middleware.git
+cd wake_lxc_middleware
 ```
 
 ### 2. Create Proxmox API Token
