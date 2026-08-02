@@ -1,0 +1,19 @@
+[Unit]
+Description=Wake LXC Middleware
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/wake-lxc-middleware
+ExecStart=/opt/wake-lxc-middleware/venv/bin/uvicorn asgi_app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/wake-lxc-middleware/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wake-lxc-middleware
+
+[Install]
+WantedBy=multi-user.target
