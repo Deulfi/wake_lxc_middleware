@@ -1,0 +1,98 @@
+# Example Traefik Configuration for Wake-LXC
+# Copy this file to traefik.config.yaml and update the placeholders below.
+
+routers:
+    # === Wake-Managed Services (Route through wake-lxc) ===
+    # Docmost - Route through wake-lxc for starting page
+    docmost:
+      entryPoints:
+        - "https"
+      rule: "Host(`<YOUR_DOMAIN>`)"
+      middlewares:
+        - default-headers
+        - https-redirectscheme
+      tls: {}
+      service: wake-docmost
+    
+    # Photos - Route through wake-lxc for starting page  
+    photos:
+      entryPoints:
+        - "https"
+      rule: "Host(`<YOUR_DOMAIN>`)"
+      middlewares:
+        - default-headers
+        - https-redirectscheme
+      tls: {}
+      service: wake-photos
+
+    # n8n - Route through wake-lxc for starting page
+    n8n:
+      entryPoints:
+        - "https"
+      rule: "Host(`<YOUR_DOMAIN>`)"
+      middlewares:
+        - default-headers
+        - https-redirectscheme
+      tls: {}
+      service: wake-n8n
+    
+# Add the service to your routers
+services:
+    # === Wake-LXC Proxy Service ===
+    # All wake-managed services route through this
+    wake-docmost:
+      loadBalancer:
+        servers:
+          - url: "http://wake-lxc:8080"
+          - url: "http://<CONTAINER_IP>:<PORT>"
+        passHostHeader: true
+        healthCheck:
+          path: "/healthz"
+          interval: "10s"
+          timeout: "5s"
+    wake-photos:
+      loadBalancer:
+        servers:
+          - url: "http://wake-lxc:8080"
+          - url: "http://<CONTAINER_IP>:<PORT>"
+        passHostHeader: true
+        healthCheck:
+          path: "/healthz"
+          interval: "10s"
+          timeout: "5s"
+    wake-n8n:
+      loadBalancer:
+        servers:
+          - url: "http://wake-lxc:8080"
+          - url: "http://<CONTAINER_IP>:<PORT>"
+        passHostHeader: true
+        healthCheck:
+          path: "/healthz"
+          interval: "10s"
+          timeout: "5s"
+
+middlewares:
+    # HTTPS Redirect
+    https-redirectscheme:
+      redirectScheme:
+        scheme: https
+        permanent: true
+        
+    # Security Headers
+    default-headers:
+      headers:
+        frameDeny: true
+        browserXssFilter: true
+        contentTypeNosniff: true
+        forceSTSHeader: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        stsSeconds: 31536000
+        customFrameOptionsValue: "SAMEORIGIN"
+        referrerPolicy: "strict-origin-when-cross-origin"
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+          X-Forwarded-Port: "443"
+        customResponseHeaders:
+          Server: ""
+          X-Powered-By: ""
