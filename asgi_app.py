@@ -201,7 +201,7 @@ async def forward_auth(request: Request):
     </body>
     </html>
     """
-    return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(content=html, status_code=503)
 
 @app.get("/status/{host}")
 async def status_stream(host: str):
