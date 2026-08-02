@@ -3,69 +3,63 @@
 # The middleware acts as a gatekeeper via forwardAuth. It does not proxy traffic.
 
 routers:
-    # Example: Route for docmost
-    docmost:
-      entryPoints:
-        - "https"
-      rule: "Host(`docmost.sub.domain.name`)"
-      middlewares:
-        - default-headers
-        - https-redirectscheme
-        - forward-auth
-      tls: {}
-      service: docmost
-    
-    # Example: Route for n8n
-    n8n:
-      entryPoints:
-        - "https"
-      rule: "Host(`n8n.sub.domain.name`)"
-      middlewares:
-        - default-headers
-        - https-redirectscheme
-        - forward-auth
-      tls: {}
-      service: n8n
+  docmost:
+    entryPoints:
+      - "https"
+    rule: "Host(`docmost.sub.domain.name`)"
+    middlewares:
+      - default-headers
+      - https-redirectscheme
+      - forward-auth
+    tls: {}
+    service: docmost
+  
+  n8n:
+    entryPoints:
+      - "https"
+    rule: "Host(`n8n.sub.domain.name`)"
+    middlewares:
+      - default-headers
+      - https-redirectscheme
+      - forward-auth
+    tls: {}
+    service: n8n
 
 services:
-    # Real backend services
-    docmost:
-      loadBalancer:
-        servers:
-          - url: "http://<docmost-host>:3003"
-    n8n:
-      loadBalancer:
-        servers:
-          - url: "http://<n8n-host>:5678"
+  docmost:
+    loadBalancer:
+      servers:
+        - url: "http://<docmost-host>:3003"
+  n8n:
+    loadBalancer:
+      servers:
+        - url: "http://<n8n-host>:5678"
 
 middlewares:
-    # HTTPS Redirect
-    https-redirectscheme:
-      redirectScheme:
-        scheme: https
-        permanent: true
-        
-    # Security Headers
-    default-headers:
-      headers:
-        frameDeny: true
-        browserXssFilter: true
-        contentTypeNosniff: true
-        forceSTSHeader: true
-        stsIncludeSubdomains: true
-        stsPreload: true
-        stsSeconds: 31536000
-        customFrameOptionsValue: "SAMEORIGIN"
-        referrerPolicy: "strict-origin-when-cross-origin"
-        customRequestHeaders:
-          X-Forwarded-Proto: "https"
-          X-Forwarded-Port: "443"
-        customResponseHeaders:
-          Server: ""
-          X-Powered-By: ""
+  https-redirectscheme:
+    redirectScheme:
+      scheme: https
+      permanent: true
+  
+  default-headers:
+    headers:
+      frameDeny: true
+      browserXssFilter: true
+      contentTypeNosniff: true
+      forceSTSHeader: true
+      stsIncludeSubdomains: true
+      stsPreload: true
+      stsSeconds: 31536000
+      customFrameOptionsValue: "SAMEORIGIN"
+      referrerPolicy: "strict-origin-when-cross-origin"
+      customRequestHeaders:
+        X-Forwarded-Proto: "https"
+        X-Forwarded-Port: "443"
+      customResponseHeaders:
+        Server: ""
+        X-Powered-By: ""
 
-    # Forward Auth Middleware (calls wake_lxc_middleware)
-    forward-auth:
-      forwardAuth:
-        address: "http://wake-lxc-middleware:8000/auth"
-        trustForwardHeader: true
+  forward-auth:
+    forwardAuth:
+      address: "http://wake-lxc-middleware:8000/auth"
+      trustForwardHeader: true
