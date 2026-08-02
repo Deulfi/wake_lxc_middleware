@@ -1,70 +1,36 @@
-# Example Traefik Configuration for Wake-LXC
+# Example Traefik Configuration for wake_lxc_middleware
 # Copy this file to traefik.config.yaml and update the placeholders below.
+# Each container in config.yaml needs a corresponding Traefik router pointing to wake-lxc.
 
 routers:
-    # === Wake-Managed Services (Route through wake-lxc) ===
-    # Docmost - Route through wake-lxc for starting page
+    # Example: Route for docmost
     docmost:
       entryPoints:
         - "https"
-      rule: "Host(`<YOUR_DOMAIN>`)"
+      rule: "Host(`docmost.sub.domain.name`)"
       middlewares:
         - default-headers
         - https-redirectscheme
       tls: {}
-      service: wake-docmost
+      service: wake-lxc-proxy
     
-    # Photos - Route through wake-lxc for starting page  
-    photos:
-      entryPoints:
-        - "https"
-      rule: "Host(`<YOUR_DOMAIN>`)"
-      middlewares:
-        - default-headers
-        - https-redirectscheme
-      tls: {}
-      service: wake-photos
-
-    # n8n - Route through wake-lxc for starting page
+    # Example: Route for n8n
     n8n:
       entryPoints:
         - "https"
-      rule: "Host(`<YOUR_DOMAIN>`)"
+      rule: "Host(`n8n.sub.domain.name`)"
       middlewares:
         - default-headers
         - https-redirectscheme
       tls: {}
-      service: wake-n8n
-    
-# Add the service to your routers
+      service: wake-lxc-proxy
+
 services:
-    # === Wake-LXC Proxy Service ===
-    # All wake-managed services route through this
-    wake-docmost:
+    # Single proxy service for all wake-lxc managed containers
+    wake-lxc-proxy:
       loadBalancer:
         servers:
           - url: "http://wake-lxc:8080"
-          - url: "http://<CONTAINER_IP>:<PORT>"
-        passHostHeader: true
-        healthCheck:
-          path: "/healthz"
-          interval: "10s"
-          timeout: "5s"
-    wake-photos:
-      loadBalancer:
-        servers:
-          - url: "http://wake-lxc:8080"
-          - url: "http://<CONTAINER_IP>:<PORT>"
-        passHostHeader: true
-        healthCheck:
-          path: "/healthz"
-          interval: "10s"
-          timeout: "5s"
-    wake-n8n:
-      loadBalancer:
-        servers:
-          - url: "http://wake-lxc:8080"
-          - url: "http://<CONTAINER_IP>:<PORT>"
         passHostHeader: true
         healthCheck:
           path: "/healthz"
