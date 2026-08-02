@@ -138,7 +138,7 @@ WAKE_SECRET="XXX"
 - Ensure your `config.yaml` is correctly placed in `/opt/wake_lxc_middleware/config.yaml`.
 
 ### 6. Create Systemd Service
-Create a service file at `/etc/systemd/system/wake-middleware.service`:
+Create a service file at `/etc/systemd/system/wake_lxc_middleware.service`:
 ```ini
 [Unit]
 Description=Wake LXC Middleware
@@ -158,7 +158,7 @@ WantedBy=multi-user.target
 ### 7. Start the Service
 ```bash
 systemctl daemon-reload
-systemctl enable --now wake-middleware
+systemctl enable --now wake_lxc_middleware
 ```
 
 ## 📖 Configuration Guide
