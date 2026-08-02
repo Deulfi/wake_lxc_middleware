@@ -13,14 +13,11 @@ services:
       - /etc/timezone:/etc/timezone:ro
       - ./secrets/proxmox_token_value.txt:/run/secrets/proxmox_token_value:ro
     
-    environment:
-      PROXMOX_TOKEN_VALUE_FILE: /run/secrets/proxmox_token_value
-    
     env_file:
       - .env
     
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=5).read()"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 120s
       timeout: 10s
       retries: 3
