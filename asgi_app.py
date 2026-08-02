@@ -107,7 +107,7 @@ async def start_container(vmid: str, kind: str = "lxc") -> bool:
     try:
         logger.info(f"Starting container {vmid}...")
         async with get_proxmox_client() as client:
-            resp = await client.post(f"/api2/json/nodes/{os.getenv('PROXMOX_NODE')}/{kind}/{vmid}/status/start")
+            resp = await client.post(f"/api2/json/nodes/{os.getenv('PROXMOX_NODE')}/{kind}/{vmid}/status/start", json={})
             if resp.status_code == 200:
                 logger.info(f"Container {vmid} start command sent successfully.")
                 return True
@@ -124,7 +124,7 @@ async def shutdown_container(vmid: str, kind: str = "lxc", stop_mode: str = "shu
     try:
         logger.info(f"Shutting down container {vmid} using mode '{stop_mode}'...")
         async with get_proxmox_client() as client:
-            resp = await client.post(f"/api2/json/nodes/{os.getenv('PROXMOX_NODE')}/{kind}/{vmid}/status/{stop_mode}")
+            resp = await client.post(f"/api2/json/nodes/{os.getenv('PROXMOX_NODE')}/{kind}/{vmid}/status/{stop_mode}", json={})
             if resp.status_code == 200:
                 logger.info(f"Container {vmid} shutdown command sent successfully.")
                 return True
