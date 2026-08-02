@@ -10,7 +10,7 @@ routers:
     middlewares:
       - default-headers
       - https-redirectscheme
-      - forward-auth
+      - wake-lxc-middleware
     tls: {}
     service: docmost
   
@@ -21,7 +21,7 @@ routers:
     middlewares:
       - default-headers
       - https-redirectscheme
-      - forward-auth
+      - wake-lxc-middleware
     tls: {}
     service: n8n
 
@@ -59,7 +59,7 @@ middlewares:
         Server: ""
         X-Powered-By: ""
 
-  forward-auth:
+  wake-lxc-middleware:
     forwardAuth:
       address: "http://wake-lxc-middleware:8000/auth"
       trustForwardHeader: true
