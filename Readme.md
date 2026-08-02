@@ -1,6 +1,6 @@
 # wake_lxc_middleware: Proxmox Container On-Demand Auto Start Service
 
-**wake_lxc_middleware** is a lightweight reverse proxy and status monitor that automatically starts Proxmox LXC containers based on incoming traffic. It saves resources while maintaining seamless user access through a smart proxy layer.
+**wake_lxc_middleware** is a lightweight reverse proxy and status monitor that automatically starts Proxmox LXC containers based on incoming traffic and stops after a defined delay. It saves resources while maintaining seamless user access through a smart proxy layer.
 
 ## ✨ Features
 - **Auto-Wake**: Starts stopped containers on first request via Traefik ForwardAuth
