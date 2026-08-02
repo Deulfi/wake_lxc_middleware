@@ -205,7 +205,7 @@ async def shutdown_event():
 @app.get("/auth")
 async def forward_auth(request: Request):
     """Traefik ForwardAuth endpoint"""
-    host = request.headers.get("host") or request.headers.get("x-forwarded-host", "")
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
     logger.info(f"Auth request received for host: {host}")
     
     container = get_container_by_domain(host)
