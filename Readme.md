@@ -158,7 +158,7 @@ WantedBy=multi-user.target
 ### 7. Start the Service
 ```bash
 systemctl daemon-reload
-systemctl enable --now pub-wake
+systemctl enable --now wake-middleware
 ```
 
 ## 📖 Configuration Guide
