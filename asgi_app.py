@@ -56,7 +56,7 @@ def get_proxmox_headers() -> dict:
         "Content-Type": "application/json"
     }
 
-async def get_proxmox_client() -> httpx.AsyncClient:
+def get_proxmox_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=f"https://{os.getenv('PROXMOX_HOST', '')}:8006",
         headers=get_proxmox_headers(),
