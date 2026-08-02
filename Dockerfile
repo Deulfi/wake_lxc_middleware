@@ -1,20 +1,18 @@
 # Proxmox LXC Auto Start/Stop System - Dockerfile
 # Base image with Python 3.11 on Alpine for smaller size and security
-FROM python:3.11-slim
+FROM python:3.11-alpine
 
 # Set working directory
 WORKDIR /app
 
 # Install system dependencies required for the application
-RUN apt-get update && apt-get install -y \
+RUN apk add --no-cache \
     curl \
     ca-certificates \
-    tzdata \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    tzdata
 
 # Create non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /bin/sh appuser
+RUN addgroup -S appuser && adduser -S appuser -G appuser -h /app -s /bin/sh
 
 # Copy requirements first for better Docker layer caching
 COPY requirements.txt .
