@@ -1,6 +1,6 @@
 # Example Traefik Configuration for wake_lxc_middleware
 # Copy this file to traefik.config.yaml and update the placeholders below.
-# Each container in config.yaml needs a corresponding Traefik router pointing to wake-lxc.
+# Each container in config.yaml needs a corresponding Traefik router pointing to the wake-lxc middleware container.
 
 routers:
     # Example: Route for docmost
@@ -11,8 +11,9 @@ routers:
       middlewares:
         - default-headers
         - https-redirectscheme
+        - forward-auth  # Ensure this middleware is configured in your Traefik setup
       tls: {}
-      service: wake-lxc-proxy
+      service: wake-lxc-middleware
     
     # Example: Route for n8n
     n8n:
@@ -22,12 +23,13 @@ routers:
       middlewares:
         - default-headers
         - https-redirectscheme
+        - forward-auth
       tls: {}
-      service: wake-lxc-proxy
+      service: wake-lxc-middleware
 
 services:
-    # Single proxy service for all wake-lxc managed containers
-    wake-lxc-proxy:
+    # Traefik service definition for the wake_lxc_middleware container itself
+    wake-lxc-middleware:
       loadBalancer:
         servers:
           - url: "http://wake-lxc:8080"
