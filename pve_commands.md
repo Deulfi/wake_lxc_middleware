@@ -1,51 +1,16 @@
-***PROXMOX SETUP***
+# Proxmox LXC Wake Middleware - Operational Notes
 
-# Proxmox API token (for starting/stopping guests)
-```using CT 111 as an example replace with your actual ID```
-### Create service user, custom role, scoped token (CT 111 only)
+## Container Lifecycle
+- **Start**: Triggered automatically by Traefik on first request to a domain.
+- **Stop**: Triggered automatically after `stop_minutes` of uptime.
+- **External Stop**: If an admin stops the container via Proxmox UI/API, the watchdog detects it within `check_interval` seconds and cancels the pending stop timer. No double-stop attempts will occur.
 
-1.  Create a dedicated local user
+## Troubleshooting
+- **Container not starting**: Check `PROXMOX_*` environment variables and network connectivity to Proxmox.
+- **Watchdog not canceling timer**: Ensure `check_interval` is reasonable. The watchdog polls `/api2/json/nodes/{node}/lxc/{vmid}/status/current`.
+- **Traefik not relaying progress page**: Ensure Traefik is configured with `forwardAuth` and `trustForwardHeader: true`. The middleware returns `503` with HTML when starting, which Traefik relays to the browser.
 
-```
-pveum user add svc-wake@pve --comment "Wake-on-request service"
-```
-
-2.  Create a minimal custom role (audit+monitor+power only)
-
-```
-pveum role add WakeRole --privs "VM.Audit,VM.Monitor,VM.PowerMgmt"
-```
-
-3.  Grant that role ONLY on CT 111
-
-```
-pveum aclmod /vms/111 --user svc-wake@pve --role WakeRole
-```
-
-4.  Create a privilege-separated API token for that user
-
-### IMP(copy the returned 'value' somewhere safe; it will be shown only once)
-
-```
-pveum user token add svc-wake@pve wake --comment "wake-lxc token" --privsep 1
-```
-
-Grant the role to the token principal:
-
-### Show token(s) for sanity
-
-```
-pveum user token list svc-wake@pve
-```
-
-### Add ACL directly to the token (NOT just the user) for CT 111
-
-```
-pveum aclmod /vms/111 --token 'svc-wake@pve!wake' --role WakeRole
-```
-
-### Verify ACLs (should list /vms/111 -> svc-wake@pve!wake -> WakeRole)
-
-```
-pveum acl list | egrep 'svc-wake@pve|/vms/111|WakeRole'
-```
+## Manual Commands
+- Restart middleware: `docker restart wake_lxc_middleware`
+- Check logs: `docker logs -f wake_lxc_middleware`
+- Force stop a container (will cancel timer): `pct stop <vmid>`
