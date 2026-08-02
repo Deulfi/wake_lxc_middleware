@@ -1,9 +1,7 @@
 import asyncio
 import logging
 import os
-import re
 import time
-from datetime import datetime
 from typing import Dict, Optional, Any
 
 import httpx
@@ -113,13 +111,6 @@ def build_domain_map():
 def get_container_by_domain(domain: str) -> Optional[dict]:
     return DOMAIN_TO_CONTAINER.get(domain)
 
-
-def get_container_by_vmid(vmid: str) -> Optional[dict]:
-    for c in config["containers"]:
-        if str(c["vmid"]) == str(vmid):
-            return c
-    return None
-
 # ---------------------------------------------------------------------------
 # Proxmox API client (shared, pooled — not recreated per request)
 # ---------------------------------------------------------------------------
@@ -215,6 +206,26 @@ async def shutdown_container(vmid: str, kind: str = "lxc", stop_mode: str = "shu
         logger.error(f"VMID {vmid}: shutdown failed: {e}")
         return False
 
+
+async def wait_for_backend_ready(backend_url: Optional[str], timeout: int = 90) -> bool:
+    """Poll the real application's own port, not just the Proxmox 'running' state.
+    A container being 'running' only means the OS booted -- it says nothing about
+    whether the app inside has finished starting and is actually listening yet."""
+    if not backend_url:
+        return True  # no backend configured for this container, skip probing
+    deadline = time.time() + timeout
+    async with httpx.AsyncClient(timeout=2.0) as probe:
+        while time.time() < deadline:
+            try:
+                resp = await probe.get(backend_url)
+                if resp.status_code < 500:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+    logger.warning(f"Backend {backend_url} did not become ready within {timeout}s.")
+    return False
+
 # ---------------------------------------------------------------------------
 # Per-vmid start lock (prevents duplicate concurrent start calls)
 # ---------------------------------------------------------------------------
@@ -228,6 +239,12 @@ def get_start_lock(vmid: str) -> asyncio.Lock:
 
 # ---------------------------------------------------------------------------
 # Fixed-duration stop timer + external-stop watchdog
+#
+# NOTE: both _run() and _loop() check "is this dict entry still MY task"
+# before popping it. Without that check, an old (already-cancelled) task's
+# `finally` block can race with a newer task that just registered itself,
+# deleting the NEW task's registration and silently orphaning it -- which
+# is what caused the double-stop / double-timer bug during testing.
 # ---------------------------------------------------------------------------
 active_timers: Dict[str, asyncio.Task] = {}
 watchdog_tasks: Dict[str, asyncio.Task] = {}
@@ -241,6 +258,7 @@ def schedule_stop(container: dict):
     stop_minutes = container.get("stop_minutes", config["global"]["stop_minutes"])
 
     async def _run():
+        this_task = asyncio.current_task()
         try:
             await asyncio.sleep(stop_minutes * 60)
             logger.info(f"VMID {vmid}: stop timer fired.")
@@ -251,7 +269,8 @@ def schedule_stop(container: dict):
         except asyncio.CancelledError:
             pass
         finally:
-            active_timers.pop(vmid, None)
+            if active_timers.get(vmid) is this_task:
+                active_timers.pop(vmid, None)
 
     active_timers[vmid] = asyncio.create_task(_run())
     logger.info(f"VMID {vmid}: stop scheduled in {stop_minutes} min.")
@@ -266,6 +285,7 @@ def start_watchdog(container: dict):
     interval_sec = check_interval * 60
 
     async def _loop():
+        this_task = asyncio.current_task()
         try:
             while True:
                 await asyncio.sleep(interval_sec)
@@ -280,7 +300,8 @@ def start_watchdog(container: dict):
         except asyncio.CancelledError:
             pass
         finally:
-            watchdog_tasks.pop(vmid, None)
+            if watchdog_tasks.get(vmid) is this_task:
+                watchdog_tasks.pop(vmid, None)
 
     watchdog_tasks[vmid] = asyncio.create_task(_loop())
 
@@ -326,7 +347,7 @@ async def forward_auth(request: Request):
         start_watchdog(container)
         return JSONResponse(status_code=200, content={})
 
-    # Not running — start it (locked, so concurrent requests don't double-start)
+    # Not running -- start it (locked, so concurrent requests don't double-start)
     lock = get_start_lock(vmid)
     if not lock.locked():
         async with lock:
@@ -342,7 +363,7 @@ async def forward_auth(request: Request):
 
 @app.get("/starting")
 async def starting_page(target: str):
-    """Served on WAKE_DOMAIN only — never behind forwardAuth."""
+    """Served on WAKE_DOMAIN only -- never behind forwardAuth."""
     html = f"""<!DOCTYPE html>
 <html><head><title>Starting service</title></head>
 <body style="font-family:sans-serif;text-align:center;margin-top:15%;">
@@ -367,20 +388,24 @@ async def starting_page(target: str):
 
 @app.get("/status-stream")
 async def status_stream(target: str):
-    """Served on WAKE_DOMAIN only — never behind forwardAuth."""
+    """Served on WAKE_DOMAIN only -- never behind forwardAuth."""
     container = get_container_by_domain(target)
     if not container:
         return StreamingResponse(iter([]), media_type="text/event-stream")
 
     vmid = str(container["vmid"])
     kind = container.get("kind", "lxc")
+    backend_url = container.get("backend")
 
     async def gen():
         while True:
             if await check_container_status(vmid, kind):
-                yield "data: ready\n\n"
-                break
-            yield "data: starting...\n\n"
+                if await wait_for_backend_ready(backend_url):
+                    yield "data: ready\n\n"
+                    break
+                yield "data: waiting for service to respond...\n\n"
+            else:
+                yield "data: starting container...\n\n"
             await asyncio.sleep(2)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
