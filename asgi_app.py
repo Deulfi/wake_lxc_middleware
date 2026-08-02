@@ -95,7 +95,6 @@ async def check_container_status(vmid: str, kind: str = "lxc") -> bool:
                     return True
                 else:
                     logger.info(f"Container {vmid} is {status}.")
-                    record_container_failure(vmid)
                     return False
     except Exception as e:
         logger.error(f"Failed to check status for container {vmid}: {e}")
