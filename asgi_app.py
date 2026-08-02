@@ -164,6 +164,10 @@ def schedule_stop(container: dict):
 
 def start_watchdog(container: dict):
     vmid = str(container['vmid'])
+    if vmid in watchdog_tasks:
+        logger.info(f"Cancelling existing watchdog for container {vmid}.")
+        watchdog_tasks[vmid].cancel()
+        
     check_interval = container.get('check_interval', config['global']['check_interval'])
     # Convert check_interval from minutes to seconds for asyncio.sleep
     check_interval_seconds = check_interval * 60
