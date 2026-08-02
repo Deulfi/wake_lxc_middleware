@@ -172,6 +172,81 @@ docker compose up -d
 docker compose logs -f wake-lxc
 ```
 
+## 🐧 Manual Installation (No Docker)
+
+For those who prefer running the middleware directly on a Proxmox host or LXC container without Docker, follow these steps:
+
+### 1. Install Dependencies
+```bash
+apt update
+apt install -y python3 python3-pip git vim curl ca-certificates tzdata
+```
+
+### 2. Clone the Repository
+```bash
+cd /opt/
+git clone https://github.com/Deulfi/wake_lxc_middleware.git
+cd wake_lxc_middleware
+```
+
+### 3. Create Token File
+Create a file to store your Proxmox API token securely:
+```bash
+echo -n "YOUR_PROXMOX_TOKEN_VALUE" > /opt/wake_lxc_middleware/token.txt
+```
+
+### 4. Configure Environment Variables
+Edit `/etc/environment` and add the following:
+```bash
+# Logging
+LOG_LEVEL=INFO
+
+# Display Options
+SHOW_SUBDOMAIN_ONLY=true
+LOG_ACTIVITY_INTERVAL=60
+
+# Timezone
+TZ="Europe/London"
+
+# Proxmox Configuration
+PROXMOX_HOST="proxhome.lan"
+PROXMOX_NODE="proxmox"
+PROXMOX_TOKEN_USER="svc-wake@pve"
+PROXMOX_TOKEN_ID="wake"
+PROXMOX_VERIFY_TLS=false
+PROXMOX_TOKEN_VALUE="YOUR_ACTUAL_TOKEN_VALUE"
+WAKE_SECRET="XXX"
+```
+*Note: Update `PROXMOX_HOST`, `PROXMOX_NODE`, and other values to match your setup. Ensure `PROXMOX_TOKEN_VALUE` contains the actual token string.*
+
+### 5. Configure Traefik & Middleware
+- Add Traefik routing rules to `/etc/traefik/conf.d/pubwake.yaml` (see Traefik Configuration section above).
+- Ensure your `config.yaml` is correctly placed in `/opt/wake_lxc_middleware/config.yaml`.
+
+### 6. Create Systemd Service
+Create a service file at `/etc/systemd/system/pub-wake.service`:
+```ini
+[Unit]
+Description=Pub Wake LXC
+After=network.target
+
+[Service]
+EnvironmentFile=/etc/environment
+WorkingDirectory=/opt/wake_lxc_middleware
+ExecStart=/usr/local/bin/uvicorn asgi_app:app --host 0.0.0.0 --port 8080 --log-level info
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 7. Start the Service
+```bash
+systemctl daemon-reload
+systemctl enable --now pub-wake
+```
+
 ## 📖 Configuration Guide
 
 ### `config.yaml` Structure
