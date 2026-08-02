@@ -1,0 +1,30 @@
+services:
+  wake-lxc:
+    build: .
+    container_name: wake-lxc
+    networks:
+      - frontend
+      - backend
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs:rw
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./secrets/proxmox_token_value.txt:/run/secrets/proxmox_token_value:ro
+    
+    env_file:
+      - .env
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/healthz"]
+      interval: 120s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  frontend:
+    external: true
+  backend:
+    external: true
