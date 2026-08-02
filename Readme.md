@@ -1,10 +1,9 @@
-# Wake-LXC: Proxmox Container On-Demand Auto Start/Stop Service
+# wake_lxc_middleware: Proxmox Container On-Demand Auto Start Service
 
-**Wake-LXC** is a lightweight reverse proxy and status monitor that automatically starts and stops Proxmox LXC containers based on incoming traffic. It saves resources while maintaining seamless user access through a smart proxy layer.
+**wake_lxc_middleware** is a lightweight reverse proxy and status monitor that automatically starts Proxmox LXC containers based on incoming traffic. It saves resources while maintaining seamless user access through a smart proxy layer.
 
 ## ✨ Features
 - **Auto-Wake**: Starts stopped containers on first request via Traefik ForwardAuth
-- **Auto-Stop**: Gracefully shuts down idle containers after a configurable timeout
 - **Real-time Status**: SSE-based progress page while containers boot
 - **Watchdog & Circuit Breaker**: Prevents double-stops and handles API failures gracefully
 - **Traefik Native**: Designed to work seamlessly with Traefik v2/v3
@@ -54,10 +53,16 @@ global:
 containers:
   - vmid: 105
     kind: lxc
-    domain: app.example.com
+    domain: docmost.sub.domain.name
     stop_minutes: 60
     stop_mode: shutdown
     check_interval: 15
+  
+  - vmid: 106
+    kind: lxc
+    domain: n8n.sub.domain.name
+    stop_minutes: 120
+    stop_mode: shutdown
 ```
 *Note: Each container should have a unique `domain` that matches your Traefik router.*
 
@@ -70,25 +75,94 @@ docker network create backend
 Update `docker-compose.yml` if your network names differ.
 
 ### 6. Configure Traefik
-Add a router and service to your Traefik dynamic config:
+Add the following routers and services to your Traefik dynamic config (`traefik.config.yaml`):
 ```yaml
-http:
-  routers:
-    my-app:
+routers:
+    docmost:
       entryPoints:
         - "https"
-      rule: "Host(`app.example.com`)"
+      rule: "Host(`docmost.sub.domain.name`)"
       middlewares:
         - default-headers
         - https-redirectscheme
       tls: {}
-      service: wake-lxc-proxy
+      service: wake-docmost
+    
+    photos:
+      entryPoints:
+        - "https"
+      rule: "Host(`photos.sub.domain.name`)"
+      middlewares:
+        - default-headers
+        - https-redirectscheme
+      tls: {}
+      service: wake-photos
 
-  services:
-    wake-lxc-proxy:
+    n8n:
+      entryPoints:
+        - "https"
+      rule: "Host(`n8n.sub.domain.name`)"
+      middlewares:
+        - default-headers
+        - https-redirectscheme
+      tls: {}
+      service: wake-n8n
+    
+services:
+    wake-docmost:
       loadBalancer:
         servers:
           - url: "http://wake-lxc:8080"
+          - url: "http://<CONTAINER_IP>:<PORT>"
+        passHostHeader: true
+        healthCheck:
+          path: "/healthz"
+          interval: "10s"
+          timeout: "5s"
+    wake-photos:
+      loadBalancer:
+        servers:
+          - url: "http://wake-lxc:8080"
+          - url: "http://<CONTAINER_IP>:<PORT>"
+        passHostHeader: true
+        healthCheck:
+          path: "/healthz"
+          interval: "10s"
+          timeout: "5s"
+    wake-n8n:
+      loadBalancer:
+        servers:
+          - url: "http://wake-lxc:8080"
+          - url: "http://<CONTAINER_IP>:<PORT>"
+        passHostHeader: true
+        healthCheck:
+          path: "/healthz"
+          interval: "10s"
+          timeout: "5s"
+
+middlewares:
+    https-redirectscheme:
+      redirectScheme:
+        scheme: https
+        permanent: true
+        
+    default-headers:
+      headers:
+        frameDeny: true
+        browserXssFilter: true
+        contentTypeNosniff: true
+        forceSTSHeader: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        stsSeconds: 31536000
+        customFrameOptionsValue: "SAMEORIGIN"
+        referrerPolicy: "strict-origin-when-cross-origin"
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+          X-Forwarded-Port: "443"
+        customResponseHeaders:
+          Server: ""
+          X-Powered-By: ""
 ```
 *Ensure `trustForwardHeader: true` is set in Traefik if using forward auth.*
 
