@@ -1,15 +1,14 @@
 # wake_lxc_middleware: Proxmox Container On-Demand Auto Start Service
 
-**wake_lxc_middleware** is a Traefik ForwardAuth middleware that automatically starts a stopped Proxmox LXC/VM on first request and stops it again after a configurable idle period.
+**wake_lxc_middleware** is a Traefik ForwardAuth middleware that automatically starts a stopped Proxmox LXC/VM on first request and stops it again after a set period.
 
-> **Docker: unverified / unsupported.** This project is developed and run directly via systemd on a Proxmox host (see Manual Installation below), not in Docker. The Docker instructions below are kept from the original version of this repo but have not been tested against the current code and may not work. If you get it running in Docker, a PR is welcome.
+> **Docker: unverified / unsupported.** This project is developed and run directly via systemd on a Proxmox host (see Manual Installation below), not in Docker. The Docker instructions below are kept from an earlier version of this repo but have not been tested against the current code and may not work. If you get it running in Docker, a PR is welcome.
 
 ## ✨ Features
 - **Auto-Wake**: Starts a stopped container on first request, via Traefik ForwardAuth
-- **Real-time Status**: SSE-based progress page while the container boots, served on its own dedicated domain so it isn't caught by the same auth gate it's waiting on
+- **Real-time Status**: SSE-based progress page while the container boots
 - **Backend Readiness Check**: Optionally waits for the app inside the container to actually respond, not just for the OS to report "running"
 - **Watchdog & Circuit Breaker**: Cancels pending stop timers if a container is stopped externally; backs off on repeated Proxmox API failures
-- **Fixed-duration stop**: stops N minutes after last access (not idle-traffic-based)
 
 ## 📋 Prerequisites
 - Proxmox VE
@@ -18,7 +17,7 @@
 
 ---
 
-## 🐧 Manual Installation (systemd, no Docker)
+## 🐧 Manual Installation
 
 ### 1. Install dependencies
 ```bash
@@ -44,25 +43,53 @@ cd wake_lxc_middleware
 ### 4. Configure environment variables
 ```bash
 cp .env.example .env
-nano .env
 ```
-Fill in your Proxmox host/node/token details and `WAKE_DOMAIN` (see table below). `.env` is `.gitignore`d — it holds real secrets and should never be committed.
+Fill in your Proxmox host/node/token details and `WAKE_DOMAIN` (see table below).
 
 ### 5. Configure container mappings
 ```bash
 cp config.yaml.example config.yaml
-nano config.yaml
 ```
-Map each domain to its Proxmox VMID (see table below). `config.yaml` is also `.gitignore`d, since it contains your real domains/VMIDs.
+Map each domain to its Proxmox VMID (see table below).
 
 ### 6. Configure Traefik
-```bash
-cp traefik.config.yaml.example traefik.config.yaml
-nano traefik.config.yaml
-```
-Edit it to match your real domains, backend service addresses, and `WAKE_DOMAIN`. Then place it wherever your Traefik instance's file provider watches for dynamic config (`providers.file.directory` in your static Traefik config), or merge its contents into your existing dynamic config file.
+On your Traefik instance, add a router + middleware for each domain you want to gate, plus one ungated router for `WAKE_DOMAIN`. Example (replace domains, IPs, and ports with your own):
 
-**Important:** `WAKE_DOMAIN` must be routed to this middleware directly, with **no** `forwardAuth` middleware attached to that router. It's where the "starting..." progress page and its status stream live, and if it's gated by the same auth check it's trying to get past, the whole flow breaks. All other protected domains get the `forwardAuth` middleware pointing at this service's `/auth` endpoint.
+```yaml
+http:
+  middlewares:
+    wake-lxc-auth:
+      forwardAuth:
+        address: "http://<middleware-host>:8080/auth"
+        trustForwardHeader: true
+
+  routers:
+    wake-lxc-ui:
+      rule: "Host(`wake.example.com`)"
+      service: wake-lxc-middleware
+      # no middlewares — this router must NOT be gated by wake-lxc-auth
+      entryPoints: [websecure]
+      tls: {}
+
+    myapp:
+      rule: "Host(`myapp.example.com`)"
+      service: myapp
+      middlewares: [wake-lxc-auth]
+      entryPoints: [websecure]
+      tls: {}
+
+  services:
+    myapp:
+      loadBalancer:
+        servers:
+          - url: "http://<myapp-backend-ip>:<port>"
+    wake-lxc-middleware:
+      loadBalancer:
+        servers:
+          - url: "http://<middleware-host>:8080"
+```
+
+**Important:** `WAKE_DOMAIN`'s router must have no `forwardAuth` middleware attached. It's where the "starting..." progress page and its status stream live — if it's gated by the same auth check it's trying to get past, the whole flow breaks.
 
 ### 7. Create the systemd service
 Create `/etc/systemd/system/wake_lxc_middleware.service`:
@@ -151,8 +178,13 @@ Check `docker-compose.yml` and adjust network names/volumes to your setup. Again
 - **404 "Container not found" on `/auth`**: the `Host`/`X-Forwarded-Host` value Traefik is sending doesn't match any `domain` in `config.yaml`. Check `trustForwardHeader: true` is set on your Traefik forwardAuth middleware.
 - **Bad Gateway right after the starting page redirects back**: the container's OS came up but the app inside hadn't started listening yet. Add a `backend` field for that container so the middleware waits for the actual app, not just the OS.
 - **"Connection lost" on the starting page, looping start attempts**: `WAKE_DOMAIN` is missing its own Traefik router, or that router still has `forwardAuth` attached to it. It must be routed directly with no auth middleware.
-- **Container stops immediately after starting, or stops twice**: check `stop_minutes` isn't set unrealistically low, and that you're on a current build — this exact symptom was caused by an asyncio task-cleanup race in earlier versions.
+- **Watchdog not cancelling a stop timer after an external stop**: check `check_interval` isn't longer than how quickly you need it to react — the watchdog polls `/api2/json/nodes/{node}/lxc/{vmid}/status/current` on that interval.
 - **Circuit breaker open / status checks skipped**: the breaker opens for 5 minutes after a real Proxmox API failure (not for a container being legitimately stopped). Check Proxmox connectivity and token validity if this fires repeatedly.
+
+### Manual commands
+- Restart middleware: `systemctl restart wake_lxc_middleware`
+- Check logs: `journalctl -u wake_lxc_middleware -f`
+- Force-stop a container (cancels any pending stop timer via the watchdog): `pct stop <vmid>`
 
 ## 🏗️ Architecture
 ```
