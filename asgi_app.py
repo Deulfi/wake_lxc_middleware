@@ -79,7 +79,7 @@ WAKE_DOMAIN = PVE["wake_domain"]
 # ---------------------------------------------------------------------------
 config: Dict[str, Any] = {}
 DOMAIN_TO_CONTAINER: Dict[str, dict] = {}
-
+VALID_KINDS = {"lxc", "qemu"}
 
 def load_config() -> dict:
     path = os.getenv("CONFIG_PATH", "config.yaml")
@@ -96,7 +96,10 @@ def load_config() -> dict:
             raise ValueError(f"config.yaml: container {i} missing 'vmid'")
         if "domain" not in c and "domains" not in c:
             raise ValueError(f"config.yaml: container {i} missing 'domain' or 'domains'")
+        if c.get("kind", "lxc") not in VALID_KINDS:
+            raise ValueError(f"config.yaml: container {i} has invalid 'kind': {c.get('kind')!r} (must be 'lxc' or 'qemu')")            
     return cfg
+
 
 
 def build_domain_map():
