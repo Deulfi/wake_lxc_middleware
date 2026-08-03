@@ -1,20 +1,23 @@
-# Wake-LXC Middleware Configuration
-# Proxmox credentials loaded from environment variables (.env)
+# wake_lxc_middleware configuration
+# Proxmox credentials are loaded from environment variables (.env), not here.
 
 global:
-  stop_minutes: 10
-  check_interval: 30
+  stop_minutes: 720      # default: stop N minutes after last access
+  check_interval: 60     # default: watchdog poll interval, in minutes
 
 containers:
-  - vmid: 105
-    kind: lxc
-    domain: docmost.sub.domain.name
-    stop_minutes: 60
-    stop_mode: shutdown
-    check_interval: 15
-  
+  - vmid: 150                   # Proxmox VMID
+    kind: lxc                   # 'lxc' or 'qemu'
+    domain: lxc.sub.domain.name # REQUIRED: external hostname, used to look up which container a request is for
+    backend: "http://IP:PORT"   # OPTIONAL: internal address, used only to check the app itself is ready (not just the OS booted). Omit to skip this check.
+    stop_minutes: 60            # overrides global default for this container
+    stop_mode: shutdown         # or 'stop' for a hard poweroff
+    check_interval: 10          # overrides global default for this container
+
   - vmid: 106
     kind: lxc
     domain: n8n.sub.domain.name
+    backend: "http://10.0.100.106:5678"
     stop_minutes: 120
     stop_mode: shutdown
+
