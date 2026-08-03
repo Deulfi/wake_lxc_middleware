@@ -1,210 +1,171 @@
-# Wake-LXC-Middleware: Proxmox Container On-Demand Auto Start Service
+# wake_lxc_middleware: Proxmox Container On-Demand Auto Start Service
 
-** This is a slork (AI slop fork) and there is no docker image **
-**wake_lxc_middleware** is a lightweight reverse proxy and status monitor that automatically starts Proxmox LXC containers based on incoming traffic and stops after a defined delay. It saves resources while maintaining seamless user access through a smart proxy layer.
+**wake_lxc_middleware** is a Traefik ForwardAuth middleware that automatically starts a stopped Proxmox LXC/VM on first request and stops it again after a configurable idle period.
+
+> **Docker: unverified / unsupported.** This project is developed and run directly via systemd on a Proxmox host (see Manual Installation below), not in Docker. The Docker instructions below are kept from the original version of this repo but have not been tested against the current code and may not work. If you get it running in Docker, a PR is welcome.
 
 ## ✨ Features
-- **Auto-Wake**: Starts stopped containers on first request via Traefik ForwardAuth
-- **Real-time Status**: SSE-based progress page while containers boot
-- **Watchdog & Circuit Breaker**: Prevents double-stops and handles API failures gracefully
-- **Traefik Native**: Designed to work seamlessly with Traefik v2/v3
-- **Secure**: Supports Docker secrets and environment-based credential management
+- **Auto-Wake**: Starts a stopped container on first request, via Traefik ForwardAuth
+- **Real-time Status**: SSE-based progress page while the container boots, served on its own dedicated domain so it isn't caught by the same auth gate it's waiting on
+- **Backend Readiness Check**: Optionally waits for the app inside the container to actually respond, not just for the OS to report "running"
+- **Watchdog & Circuit Breaker**: Cancels pending stop timers if a container is stopped externally; backs off on repeated Proxmox API failures
+- **Fixed-duration stop**: stops N minutes after last access (not idle-traffic-based)
 
 ## 📋 Prerequisites
-- Docker & Docker Compose
-- Proxmox VE (8.x)
-- Traefik Reverse Proxy
-- LXC Containers running your services
+- Proxmox VE
+- Traefik (v2/v3) already routing your other services
+- Python 3.11+ (for manual install)
 
-## 🚀 Quick Start
+---
 
-### 1. Clone & Setup
-```bash
-git clone https://github.com/Deulfi/wake_lxc_middleware.git
-cd wake_lxc_middleware
-```
+## 🐧 Manual Installation (systemd, no Docker)
 
-### 2. Create Proxmox API Token
-1. Create a dedicated user in Proxmox (`Datacenter → Permissions → Users`)
-2. Assign minimal permissions: `VM.PowerMgmt` and `VM.Audit`
-3. Generate an API Token (`Datacenter → Permissions → API Tokens`)
-   - **Uncheck** "Privilege Separation" for simpler inheritance
-   - **Save** the token value immediately (shown only once)
-
-### 3. Configure Secrets & Environment
-```bash
-mkdir -p secrets
-echo -n "YOUR_PROXMOX_TOKEN_VALUE" > secrets/proxmox_token_value.txt
-chmod 644 secrets/proxmox_token_value.txt
-```
-
-Create `.env` from the example:
-```bash
-cp .env.example .env
-# Edit .env with your Proxmox host, node, and token details
-```
-
-### 4. Configure Container Mappings
-Edit `config.yaml` to map domains to Proxmox VMIDs:
-```yaml
-global:
-  stop_minutes: 10
-  check_interval: 30
-
-containers:
-  - vmid: 105
-    kind: lxc
-    domain: docmost.sub.domain.name
-    stop_minutes: 60
-    stop_mode: shutdown
-    check_interval: 15
-  
-  - vmid: 106
-    kind: lxc
-    domain: n8n.sub.domain.name
-    stop_minutes: 120
-    stop_mode: shutdown
-```
-*Note: Each container should have a unique `domain` that matches your Traefik router.*
-
-### 5. Setup Docker Networks
-Ensure your Traefik networks exist, or create them:
-```bash
-docker network create frontend
-docker network create backend
-```
-Update `docker-compose.yml` if your network names differ.
-
-### 6. Configure Traefik
-Add the following routers and services to your Traefik dynamic config. A complete example is provided in `traefik.config.yaml.example`. Copy it to `traefik.config.yaml` and update the placeholders to match your domains and network setup.
-
-*Ensure `trustForwardHeader: true` is set in Traefik if using forward auth.*
-
-### 7. Deploy
-```bash
-docker compose up -d
-docker compose logs -f wake-lxc
-```
-
-## 🐧 Manual Installation (No Docker)
-
-For those who prefer running the middleware directly on a Proxmox host or LXC container without Docker, follow these steps:
-
-### 1. Install Dependencies
+### 1. Install dependencies
 ```bash
 apt update
-apt install -y python3 python3-pip git vim curl ca-certificates tzdata
+apt install -y python3 python3-pip git curl ca-certificates
+pip install -r requirements.txt --break-system-packages
 ```
 
-### 2. Clone the Repository
+### 2. Clone the repository
 ```bash
 cd /opt/
 git clone https://github.com/Deulfi/wake_lxc_middleware.git
 cd wake_lxc_middleware
 ```
 
-### 3. Create Token File
-Create a file to store your Proxmox API token securely:
+### 3. Create a Proxmox API token
+1. `Datacenter → Permissions → Users` — create a dedicated user (e.g. `svc-wake@pve`)
+2. Assign minimal permissions: `VM.PowerMgmt` and `VM.Audit`
+3. `Datacenter → Permissions → API Tokens` — generate a token for that user
+   - Uncheck "Privilege Separation" for simpler permission inheritance
+   - Save the token secret immediately — it's shown only once
+
+### 4. Configure environment variables
 ```bash
-echo -n "YOUR_PROXMOX_TOKEN_VALUE" > /opt/wake_lxc_middleware/token.txt
+cp .env.example .env
+nano .env
 ```
+Fill in your Proxmox host/node/token details and `WAKE_DOMAIN` (see table below). `.env` is `.gitignore`d — it holds real secrets and should never be committed.
 
-### 4. Configure Environment Variables
-Edit `/etc/environment` and add the following:
+### 5. Configure container mappings
 ```bash
-# Logging
-LOG_LEVEL=INFO
-
-# Display Options
-SHOW_SUBDOMAIN_ONLY=true
-LOG_ACTIVITY_INTERVAL=60
-
-# Timezone
-TZ="Europe/London"
-
-# Proxmox Configuration
-PROXMOX_HOST="proxhome.lan"
-PROXMOX_NODE="proxmox"
-PROXMOX_TOKEN_USER="svc-wake@pve"
-PROXMOX_TOKEN_ID="wake"
-PROXMOX_VERIFY_TLS=false
-PROXMOX_TOKEN_VALUE="YOUR_ACTUAL_TOKEN_VALUE"
-WAKE_SECRET="XXX"
-CONFIG_PATH="/app/config.yaml"
+cp config.yaml.example config.yaml
+nano config.yaml
 ```
-*Note: Update `PROXMOX_HOST`, `PROXMOX_NODE`, and other values to match your setup. Ensure `PROXMOX_TOKEN_VALUE` contains the actual token string.*
+Map each domain to its Proxmox VMID (see table below). `config.yaml` is also `.gitignore`d, since it contains your real domains/VMIDs.
 
-### 5. Configure Traefik & Middleware
-- Add Traefik routing rules to `/etc/traefik/conf.d/wakemiddleware.yaml` (see Traefik Configuration section above).
-- Ensure your `config.yaml` is correctly placed in `/opt/wake_lxc_middleware/config.yaml`.
+### 6. Configure Traefik
+```bash
+cp traefik.config.yaml.example traefik.config.yaml
+nano traefik.config.yaml
+```
+Edit it to match your real domains, backend service addresses, and `WAKE_DOMAIN`. Then place it wherever your Traefik instance's file provider watches for dynamic config (`providers.file.directory` in your static Traefik config), or merge its contents into your existing dynamic config file.
 
-### 6. Create Systemd Service
-Create a service file at `/etc/systemd/system/wake_lxc_middleware.service`:
+**Important:** `WAKE_DOMAIN` must be routed to this middleware directly, with **no** `forwardAuth` middleware attached to that router. It's where the "starting..." progress page and its status stream live, and if it's gated by the same auth check it's trying to get past, the whole flow breaks. All other protected domains get the `forwardAuth` middleware pointing at this service's `/auth` endpoint.
+
+### 7. Create the systemd service
+Create `/etc/systemd/system/wake_lxc_middleware.service`:
 ```ini
 [Unit]
 Description=Wake LXC Middleware
 After=network.target
 
 [Service]
-EnvironmentFile=/etc/environment
+EnvironmentFile=/opt/wake_lxc_middleware/.env
 WorkingDirectory=/opt/wake_lxc_middleware
-ExecStart=/usr/local/bin/uvicorn asgi_app:app --host 0.0.0.0 --port 8080 --log-level info
+ExecStart=/usr/local/bin/uvicorn asgi_app:app --host ${BIND_HOST} --port ${BIND_PORT}
 Restart=always
 User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wake-lxc-middleware
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### 7. Start the Service
+### 8. Start the service
 ```bash
 systemctl daemon-reload
 systemctl enable --now wake_lxc_middleware
+journalctl -u wake_lxc_middleware -f
 ```
 
-## 📖 Configuration Guide
+---
 
-### `config.yaml` Structure
-| Field | Type | Description |
-|-------|------|-------------|
-| `global.stop_minutes` | int | Default idle timeout before shutdown |
-| `global.check_interval` | int | Seconds between watchdog status checks |
-| `containers[].vmid` | int | Proxmox container ID |
-| `containers[].kind` | string | `lxc` or `qemu` |
-| `containers[].domain` | string | FQDN that triggers this container |
-| `containers[].stop_minutes` | int | Override global idle timeout |
-| `containers[].stop_mode` | string | `shutdown` (graceful) or `stop` (force) |
-| `containers[].check_interval` | int | Override global check interval |
+## 🐳 Docker (unverified, may not work as-is)
 
-### `.env` Variables
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `PROXMOX_HOST` | Proxmox IP/Hostname | `192.168.1.100` |
-| `PROXMOX_NODE` | Proxmox node name | `pve` |
-| `PROXMOX_TOKEN_USER` | API token user | `svc-wake@pve` |
-| `PROXMOX_TOKEN_ID` | API token ID | `wake` |
-| `PROXMOX_TOKEN_VALUE` | API token secret | *(loaded from file or env)* |
-| `PROXMOX_VERIFY_TLS` | Verify Proxmox SSL | `false` |
-| `LOG_LEVEL` | Logging verbosity | `INFO` |
-| `CONFIG_PATH` | Path to the application config file | `/app/config.yaml` |
+```bash
+git clone https://github.com/Deulfi/wake_lxc_middleware.git
+cd wake_lxc_middleware
+cp .env.example .env      # fill in your values
+cp config.yaml.example config.yaml
+docker compose up -d
+docker compose logs -f
+```
+Check `docker-compose.yml` and adjust network names/volumes to your setup. Again: this path is untested against the current code — treat it as a starting point, not a guarantee.
+
+---
+
+## 📖 Configuration Reference
+
+### `config.yaml`
+| Field | Required | Description |
+|-------|----------|-------------|
+| `global.stop_minutes` | yes | Default: stop N minutes after last access |
+| `global.check_interval` | yes | Default: watchdog poll interval, in minutes |
+| `containers[].vmid` | yes | Proxmox VMID |
+| `containers[].kind` | no (default `lxc`) | `lxc` or `qemu` — Proxmox's own terms; note it's `qemu`, not `vm` |
+| `containers[].domain` | yes | External hostname; used to look up which container a request is for |
+| `containers[].backend` | no | Internal `host:port` of the real app, used only to check the app itself has finished starting (not just that the OS booted). Omit to skip this check. |
+| `containers[].stop_minutes` | no | Overrides the global default for this container |
+| `containers[].stop_mode` | no (default `shutdown`) | `shutdown` (graceful) or `stop` (force poweroff) |
+| `containers[].check_interval` | no | Overrides the global default for this container |
+
+### `.env`
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PROXMOX_HOST` | yes | Proxmox IP/hostname |
+| `PROXMOX_NODE` | yes | Proxmox node name |
+| `PROXMOX_TOKEN_USER` | yes | API token user, e.g. `svc-wake@pve` |
+| `PROXMOX_TOKEN_ID` | yes | API token ID |
+| `PROXMOX_TOKEN_VALUE` | yes* | API token secret |
+| `PROXMOX_TOKEN_VALUE_FILE` | yes* | Path to a file containing the token secret, as an alternative to `PROXMOX_TOKEN_VALUE` |
+| `PROXMOX_VERIFY_TLS` | no (default `false`) | Verify Proxmox's TLS certificate |
+| `WAKE_DOMAIN` | yes | Dedicated domain for the "starting..." page, routed WITHOUT forwardAuth (see step 6 above) |
+| `CONFIG_PATH` | no (default `config.yaml`) | Full path to `config.yaml`, including the filename |
+| `BIND_HOST` | no (default `0.0.0.0`) | Address uvicorn binds to |
+| `BIND_PORT` | no (default `8080`) | Port uvicorn binds to |
+| `LOG_LEVEL` | no (default `INFO`) | `INFO` or `DEBUG` |
+
+*One of `PROXMOX_TOKEN_VALUE` or `PROXMOX_TOKEN_VALUE_FILE` is required.
+
+`TZ` is not read by the application — set it at the systemd unit level (`Environment=TZ=...`) or system-wide if you need it, not in `.env`.
+
+---
 
 ## 🔧 Troubleshooting
 
-- **Container won't start**: Verify token permissions (`VM.PowerMgmt`) and network connectivity to Proxmox.
-- **Watchdog cancels stop prematurely**: Increase `check_interval` or ensure the container takes longer to boot than the interval.
-- **Traefik shows 503/blank page**: Ensure Traefik is configured with `forwardAuth` and `trustForwardHeader: true`. The middleware returns a `503` with an SSE progress page during boot.
-- **Circuit breaker open**: Check Proxmox API logs. The breaker resets after 5 minutes of consecutive failures.
+- **Container won't start**: check the token has `VM.PowerMgmt`, and that `PROXMOX_HOST`/`PROXMOX_NODE` are reachable from this host.
+- **404 "Container not found" on `/auth`**: the `Host`/`X-Forwarded-Host` value Traefik is sending doesn't match any `domain` in `config.yaml`. Check `trustForwardHeader: true` is set on your Traefik forwardAuth middleware.
+- **Bad Gateway right after the starting page redirects back**: the container's OS came up but the app inside hadn't started listening yet. Add a `backend` field for that container so the middleware waits for the actual app, not just the OS.
+- **"Connection lost" on the starting page, looping start attempts**: `WAKE_DOMAIN` is missing its own Traefik router, or that router still has `forwardAuth` attached to it. It must be routed directly with no auth middleware.
+- **Container stops immediately after starting, or stops twice**: check `stop_minutes` isn't set unrealistically low, and that you're on a current build — this exact symptom was caused by an asyncio task-cleanup race in earlier versions.
+- **Circuit breaker open / status checks skipped**: the breaker opens for 5 minutes after a real Proxmox API failure (not for a container being legitimately stopped). Check Proxmox connectivity and token validity if this fires repeatedly.
 
 ## 🏗️ Architecture
 ```
-User Request → Traefik (Auth/Router) → wake-lxc:8080 → Proxmox API → LXC Container
+Protected domain (e.g. convertx.pve.lan):
+  Browser → Traefik → forwardAuth → /auth
+    running  → 200 OK → Traefik proxies to the real backend
+    stopped  → starts container → 302 redirect → WAKE_DOMAIN
+
+WAKE_DOMAIN (no forwardAuth):
+  Browser → Traefik → /starting (SSE progress page)
+    polls /status-stream until the container (and optionally its app) is ready
+    → redirects browser back to the original protected domain
 ```
-1. Traefik forwards request to `wake-lxc`
-2. `wake-lxc` checks `config.yaml` for domain match
-3. If stopped, triggers Proxmox start & returns SSE progress page
-4. If running, proxies request to backend
-5. Watchdog monitors status & cancels pending stops if externally stopped
-6. Idle timer triggers graceful shutdown after inactivity
 
 ## 📜 License
 MIT License
