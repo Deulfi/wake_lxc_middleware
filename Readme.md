@@ -130,6 +130,7 @@ PROXMOX_TOKEN_ID="wake"
 PROXMOX_VERIFY_TLS=false
 PROXMOX_TOKEN_VALUE="YOUR_ACTUAL_TOKEN_VALUE"
 WAKE_SECRET="XXX"
+CONFIG_PATH="/app/config.yaml"
 ```
 *Note: Update `PROXMOX_HOST`, `PROXMOX_NODE`, and other values to match your setup. Ensure `PROXMOX_TOKEN_VALUE` contains the actual token string.*
 
@@ -185,6 +186,7 @@ systemctl enable --now wake_lxc_middleware
 | `PROXMOX_TOKEN_VALUE` | API token secret | *(loaded from file or env)* |
 | `PROXMOX_VERIFY_TLS` | Verify Proxmox SSL | `false` |
 | `LOG_LEVEL` | Logging verbosity | `INFO` |
+| `CONFIG_PATH` | Path to the application config file | `/app/config.yaml` |
 
 ## 🔧 Troubleshooting
 
