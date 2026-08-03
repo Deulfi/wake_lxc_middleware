@@ -415,7 +415,10 @@ async def status_stream(target: str):
 async def healthz():
     return Response(content="ok", media_type="text/plain")
 
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(
+        app,
+        host=os.getenv("BIND_HOST", "0.0.0.0"),
+        port=int(os.getenv("BIND_PORT", "8080")),
+    )
