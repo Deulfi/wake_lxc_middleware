@@ -2,64 +2,35 @@
 # Copy this file to traefik.config.yaml and update the placeholders below.
 # The middleware acts as a gatekeeper via forwardAuth. It does not proxy traffic.
 
-routers:
-  docmost:
-    entryPoints:
-      - "https"
-    rule: "Host(`docmost.sub.domain.name`)"
-    middlewares:
-      - default-headers
-      - https-redirectscheme
-      - wake-lxc-middleware
-    tls: {}
-    service: docmost
-  
-  n8n:
-    entryPoints:
-      - "https"
-    rule: "Host(`n8n.sub.domain.name`)"
-    middlewares:
-      - default-headers
-      - https-redirectscheme
-      - wake-lxc-middleware
-    tls: {}
-    service: n8n
 
-services:
-  docmost:
-    loadBalancer:
-      servers:
-        - url: "http://<docmost-host>:3003"
-  n8n:
-    loadBalancer:
-      servers:
-        - url: "http://<n8n-host>:5678"
+http:
+  middlewares:
+    wake-lxc-auth:
+      forwardAuth:
+        address: "http://<middleware-host>:8080/auth"
+        trustForwardHeader: true
 
-middlewares:
-  https-redirectscheme:
-    redirectScheme:
-      scheme: https
-      permanent: true
-  
-  default-headers:
-    headers:
-      frameDeny: true
-      browserXssFilter: true
-      contentTypeNosniff: true
-      forceSTSHeader: true
-      stsIncludeSubdomains: true
-      stsPreload: true
-      stsSeconds: 31536000
-      customFrameOptionsValue: "SAMEORIGIN"
-      referrerPolicy: "strict-origin-when-cross-origin"
-      customRequestHeaders:
-        X-Forwarded-Proto: "https"
-        X-Forwarded-Port: "443"
-      customResponseHeaders:
-        Server: ""
-        X-Powered-By: ""
+  routers:
+    wake-lxc-ui:
+      rule: "Host(`wake.example.com`)"
+      service: wake-lxc-middleware
+      # no middlewares — this router must NOT be gated by wake-lxc-auth
+      entryPoints: [websecure]
+      tls: {}
 
-  wake-lxc-middleware:
-    forwardAuth:
-      address: "http://wake-lxc:8000/auth"
-      trustForwardHeader: true
+    myapp:
+      rule: "Host(`myapp.example.com`)"
+      service: myapp
+      middlewares: [wake-lxc-auth]
+      entryPoints: [websecure]
+      tls: {}
+
+  services:
+    myapp:
+      loadBalancer:
+        servers:
+          - url: "http://<myapp-backend-ip>:<port>"
+    wake-lxc-middleware:
+      loadBalancer:
+        servers:
+          - url: "http://<middleware-host>:8080"
