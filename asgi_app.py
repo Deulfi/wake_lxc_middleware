@@ -376,7 +376,7 @@ async def on_startup():
     config = load_config()
     build_domain_map()
     logger.info(f"Loaded {len(config['containers'])} container(s), {len(DOMAIN_TO_CONTAINER)} domain(s).")
-    logger.info(f"WAKE_DOMAIN = {WAKE_DOMAIN}")
+    logger.info(f"WAKE_DOMAIN = {WAKE_DOMAIN} (must be routed WITHOUT forwardAuth in Traefik)")
 
     restored = load_state()
     now = time.time()
@@ -398,14 +398,24 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # NOTE: we deliberately do NOT clear _stop_deadlines here -- state.json
-    # should still reflect pending stops so they resume correctly on the
-    # next startup. Only cancel the in-memory asyncio tasks.
-    for t in list(active_timers.values()):
+    # Cancelling a task triggers its own finally-block, which pops that
+    # vmid from _stop_deadlines and re-saves state.json -- if that happens
+    # AFTER our own save below, it silently wipes the very data we're
+    # trying to persist across the restart. So: snapshot first, cancel and
+    # wait for the cancellations to fully land, then restore the snapshot
+    # and save it LAST so it's guaranteed to be the final write.
+    preserved = dict(_stop_deadlines)
+
+    tasks = list(active_timers.values()) + list(watchdog_tasks.values())
+    for t in tasks:
         t.cancel()
-    for t in list(watchdog_tasks.values()):
-        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    _stop_deadlines.clear()
+    _stop_deadlines.update(preserved)
     await save_state()
+
     if _proxmox_client:
         await _proxmox_client.aclose()
 
@@ -557,6 +567,7 @@ async def status_stream(target: str):
             if await check_container_status(vmid, kind):
                 if await wait_for_backend_ready(backend_url, timeout=2):
                     yield f"data: {json.dumps({'message': 'Ready! Redirecting...', 'level': 'ready'})}\n\n"
+                    status_events.pop(target, None)  # nothing further needed for this domain
                     break
                 else:
                     yield f"data: {json.dumps({'message': 'Container running, waiting for the app to respond...'})}\n\n"
