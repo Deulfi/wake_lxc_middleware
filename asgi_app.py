@@ -1,13 +1,15 @@
 import asyncio
+import json
 import logging
 import os
 import time
+from collections import deque
 from typing import Dict, Optional, Any
 
 import httpx
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -79,7 +81,7 @@ WAKE_DOMAIN = PVE["wake_domain"]
 # ---------------------------------------------------------------------------
 config: Dict[str, Any] = {}
 DOMAIN_TO_CONTAINER: Dict[str, dict] = {}
-VALID_KINDS = {"lxc", "qemu"}
+
 
 def load_config() -> dict:
     path = os.getenv("CONFIG_PATH", "config.yaml")
@@ -96,10 +98,7 @@ def load_config() -> dict:
             raise ValueError(f"config.yaml: container {i} missing 'vmid'")
         if "domain" not in c and "domains" not in c:
             raise ValueError(f"config.yaml: container {i} missing 'domain' or 'domains'")
-        if c.get("kind", "lxc") not in VALID_KINDS:
-            raise ValueError(f"config.yaml: container {i} has invalid 'kind': {c.get('kind')!r} (must be 'lxc' or 'qemu')")            
     return cfg
-
 
 
 def build_domain_map():
@@ -113,6 +112,13 @@ def build_domain_map():
 
 def get_container_by_domain(domain: str) -> Optional[dict]:
     return DOMAIN_TO_CONTAINER.get(domain)
+
+
+def get_container_by_vmid(vmid: str) -> Optional[dict]:
+    for c in config.get("containers", []):
+        if str(c["vmid"]) == str(vmid):
+            return c
+    return None
 
 # ---------------------------------------------------------------------------
 # Proxmox API client (shared, pooled — not recreated per request)
@@ -210,6 +216,22 @@ async def shutdown_container(vmid: str, kind: str = "lxc", stop_mode: str = "shu
         return False
 
 
+# ---------------------------------------------------------------------------
+# Status events -- richer SSE messages instead of a generic "starting..."
+# string, adopted from the original repo's approach.
+# ---------------------------------------------------------------------------
+status_events: Dict[str, dict] = {}
+status_lock = asyncio.Lock()
+container_start_times: Dict[str, float] = {}
+
+
+async def emit_status_event(domain: str, message: str, level: str = "info"):
+    async with status_lock:
+        if domain not in status_events:
+            status_events[domain] = {"queue": deque(maxlen=50)}
+        status_events[domain]["queue"].append({"message": message, "level": level})
+
+
 async def wait_for_backend_ready(backend_url: Optional[str], timeout: int = 90) -> bool:
     """Poll the real application's own port, not just the Proxmox 'running' state.
     A container being 'running' only means the OS booted -- it says nothing about
@@ -251,19 +273,51 @@ def get_start_lock(vmid: str) -> asyncio.Lock:
 # ---------------------------------------------------------------------------
 active_timers: Dict[str, asyncio.Task] = {}
 watchdog_tasks: Dict[str, asyncio.Task] = {}
+_stop_deadlines: Dict[str, float] = {}  # vmid -> unix timestamp, mirrors active_timers for persistence
+
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
+_state_lock = asyncio.Lock()
 
 
-def schedule_stop(container: dict):
+async def save_state():
+    """Persist pending stop deadlines to disk so a restart doesn't strand
+    running containers with no stop timer (they'd otherwise stay up forever
+    until someone happens to hit /auth again)."""
+    async with _state_lock:
+        try:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(_stop_deadlines, f)
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            logger.error(f"Failed to save state file: {e}")
+
+
+def load_state() -> Dict[str, float]:
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"State file unreadable ({e}), starting fresh.")
+        return {}
+
+
+def schedule_stop(container: dict, initial_delay_seconds: Optional[float] = None):
     vmid = str(container["vmid"])
     if vmid in active_timers:
         active_timers[vmid].cancel()
 
     stop_minutes = container.get("stop_minutes", config["global"]["stop_minutes"])
+    delay = initial_delay_seconds if initial_delay_seconds is not None else stop_minutes * 60
+    _stop_deadlines[vmid] = time.time() + delay
+    asyncio.create_task(save_state())
 
     async def _run():
         this_task = asyncio.current_task()
         try:
-            await asyncio.sleep(stop_minutes * 60)
+            await asyncio.sleep(delay)
             logger.info(f"VMID {vmid}: stop timer fired.")
             if await check_container_status(vmid, container.get("kind", "lxc")):
                 await shutdown_container(vmid, container.get("kind", "lxc"), container.get("stop_mode", "shutdown"))
@@ -274,9 +328,11 @@ def schedule_stop(container: dict):
         finally:
             if active_timers.get(vmid) is this_task:
                 active_timers.pop(vmid, None)
+                _stop_deadlines.pop(vmid, None)
+                await save_state()
 
     active_timers[vmid] = asyncio.create_task(_run())
-    logger.info(f"VMID {vmid}: stop scheduled in {stop_minutes} min.")
+    logger.info(f"VMID {vmid}: stop scheduled in {delay/60:.1f} min.")
 
 
 def start_watchdog(container: dict):
@@ -322,13 +378,34 @@ async def on_startup():
     logger.info(f"Loaded {len(config['containers'])} container(s), {len(DOMAIN_TO_CONTAINER)} domain(s).")
     logger.info(f"WAKE_DOMAIN = {WAKE_DOMAIN} (must be routed WITHOUT forwardAuth in Traefik)")
 
+    restored = load_state()
+    now = time.time()
+    for vmid, deadline in restored.items():
+        container = get_container_by_vmid(vmid)
+        if not container:
+            continue  # container removed from config since last run
+        remaining = deadline - now
+        if remaining <= 0:
+            logger.info(f"VMID {vmid}: stop was overdue while offline, stopping now.")
+            asyncio.create_task(shutdown_container(
+                vmid, container.get("kind", "lxc"), container.get("stop_mode", "shutdown")
+            ))
+        else:
+            logger.info(f"VMID {vmid}: resuming stop timer, {remaining/60:.1f} min remaining.")
+            schedule_stop(container, initial_delay_seconds=remaining)
+        start_watchdog(container)
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    # NOTE: we deliberately do NOT clear _stop_deadlines here -- state.json
+    # should still reflect pending stops so they resume correctly on the
+    # next startup. Only cancel the in-memory asyncio tasks.
     for t in list(active_timers.values()):
         t.cancel()
     for t in list(watchdog_tasks.values()):
         t.cancel()
+    await save_state()
     if _proxmox_client:
         await _proxmox_client.aclose()
 
@@ -351,11 +428,18 @@ async def forward_auth(request: Request):
         return JSONResponse(status_code=200, content={})
 
     # Not running -- start it (locked, so concurrent requests don't double-start)
+    vmid_key = vmid
+    container_start_times[vmid_key] = time.time()
+    await emit_status_event(host, "Container is stopped, starting now...")
+
     lock = get_start_lock(vmid)
     if not lock.locked():
         async with lock:
             if not await check_container_status(vmid, kind):
-                await start_container(vmid, kind)
+                if await start_container(vmid, kind):
+                    await emit_status_event(host, "Start command sent successfully.")
+                else:
+                    await emit_status_event(host, "Failed to send start command -- check Proxmox connectivity.", "error")
 
     schedule_stop(container)
     start_watchdog(container)
@@ -368,25 +452,85 @@ async def forward_auth(request: Request):
 async def starting_page(target: str):
     """Served on WAKE_DOMAIN only -- never behind forwardAuth."""
     html = f"""<!DOCTYPE html>
-<html><head><title>Starting service</title></head>
-<body style="font-family:sans-serif;text-align:center;margin-top:15%;">
-  <h2>Starting container...</h2>
-  <p id="status">Checking status...</p>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Service Starting</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 20px;
+        }}
+        .container {{
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 32px 28px;
+            box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            max-width: 420px;
+            width: 90%;
+        }}
+        .logo {{ font-size: 3rem; margin-bottom: 12px; animation: pulse 2s ease-in-out infinite alternate; }}
+        @keyframes pulse {{ from {{ transform: scale(1); }} to {{ transform: scale(1.08); }} }}
+        h1 {{ font-size: 1.5rem; margin-bottom: 12px; font-weight: 600; }}
+        .spinner {{
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top: 3px solid white;
+            width: 40px; height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }}
+        @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+        .status-text {{ font-size: 1.05rem; line-height: 1.4; opacity: 0.95; margin: 16px 0; min-height: 28px; }}
+        .timer {{ font-size: 0.85rem; opacity: 0.7; margin: 8px 0; }}
+        .error {{ background: rgba(255, 107, 107, 0.2); border: 1px solid rgba(255, 107, 107, 0.3); }}
+    </style>
+</head>
+<body>
+  <div class="container" id="main-container">
+    <div class="logo">🚀</div>
+    <h1>{target}</h1>
+    <div class="spinner"></div>
+    <div class="status-text" id="status-text">Checking status...</div>
+    <div class="timer" id="timer">Elapsed: 0s</div>
+  </div>
   <script>
+    const startedAt = Date.now();
+    const statusText = document.getElementById('status-text');
+    const timerEl = document.getElementById('timer');
+    const container = document.getElementById('main-container');
+
+    setInterval(() => {{
+      timerEl.textContent = `Elapsed: ${{Math.floor((Date.now() - startedAt) / 1000)}}s`;
+    }}, 1000);
+
     const evtSource = new EventSource('/status-stream?target={target}');
     evtSource.onmessage = (event) => {{
-      document.getElementById('status').innerText = event.data;
-      if (event.data === 'ready') {{
+      const data = JSON.parse(event.data);
+      if (data.message) statusText.textContent = data.message;
+      if (data.level === 'error') container.classList.add('error');
+      if (data.level === 'ready') {{
         evtSource.close();
         window.location.href = 'https://{target}/';
       }}
     }};
     evtSource.onerror = () => {{
-      document.getElementById('status').innerText = 'Connection lost, retrying...';
+      statusText.textContent = 'Connection lost, retrying...';
     }};
   </script>
 </body></html>"""
-    return HTMLResponse(content=html)
+    return Response(content=html, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/status-stream")
@@ -399,29 +543,33 @@ async def status_stream(target: str):
     vmid = str(container["vmid"])
     kind = container.get("kind", "lxc")
     backend_url = container.get("backend")
+    last_sent = 0
 
     async def gen():
+        nonlocal last_sent
         while True:
+            async with status_lock:
+                queued = list(status_events.get(target, {}).get("queue", []))
+            for event in queued[last_sent:]:
+                yield f"data: {json.dumps(event)}\n\n"
+            last_sent = len(queued)
+
             if await check_container_status(vmid, kind):
-                if await wait_for_backend_ready(backend_url):
-                    yield "data: ready\n\n"
+                if await wait_for_backend_ready(backend_url, timeout=2):
+                    yield f"data: {json.dumps({'message': 'Ready! Redirecting...', 'level': 'ready'})}\n\n"
                     break
-                yield "data: waiting for service to respond...\n\n"
-            else:
-                yield "data: starting container...\n\n"
+                else:
+                    yield f"data: {json.dumps({'message': 'Container running, waiting for the app to respond...'})}\n\n"
             await asyncio.sleep(2)
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/healthz")
 async def healthz():
     return Response(content="ok", media_type="text/plain")
 
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app,
-        host=os.getenv("BIND_HOST", "0.0.0.0"),
-        port=int(os.getenv("BIND_PORT", "8080")),
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8080)
