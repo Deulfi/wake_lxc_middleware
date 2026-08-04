@@ -355,6 +355,8 @@ def start_watchdog(container: dict):
                     task = active_timers.pop(vmid, None)
                     if task:
                         task.cancel()
+                    _stop_deadlines.pop(vmid, None)
+                    await save_state()
                     break
         except asyncio.CancelledError:
             pass
