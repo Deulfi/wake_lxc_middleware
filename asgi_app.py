@@ -376,7 +376,7 @@ async def on_startup():
     config = load_config()
     build_domain_map()
     logger.info(f"Loaded {len(config['containers'])} container(s), {len(DOMAIN_TO_CONTAINER)} domain(s).")
-    logger.info(f"WAKE_DOMAIN = {WAKE_DOMAIN} (must be routed WITHOUT forwardAuth in Traefik)")
+    logger.info(f"WAKE_DOMAIN = {WAKE_DOMAIN}")
 
     restored = load_state()
     now = time.time()
