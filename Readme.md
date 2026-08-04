@@ -202,3 +202,7 @@ WAKE_DOMAIN (no forwardAuth):
 
 ## 📜 License
 MIT License
+
+
+## Credits
+itsddpanda for the original project [Wake-LXC](https://github.com/itsddpanda/pub_wake_lxc/tree/main)
