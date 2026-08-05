@@ -19,6 +19,19 @@
 
 ## 🐧 Manual Installation
 
+### 0. Create a container for this service
+Run wake_lxc_middleware in its own small Debian LXC — **not on the Proxmox host itself**. It needs network access to the Proxmox API and to whatever domain Traefik routes to it, but no special host privileges.
+
+```bash
+# on the Proxmox host, from a Debian 12 template
+pct create <new_vmid> local:vztmpl/debian-12-standard_*.tar.zst \
+  --hostname wake-lxc --cores 1 --memory 512 \
+  --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+  --unprivileged 1 --start 1
+pct enter <new_vmid>
+```
+The rest of this guide runs **inside that container**.
+
 ### 1. Install dependencies
 ```bash
 apt update
@@ -34,11 +47,17 @@ pip install -r requirements.txt --break-system-packages
 ```
 
 ### 3. Create a Proxmox API token
-1. `Datacenter → Permissions → Users` — create a dedicated user (e.g. `svc-wake@pve`)
-2. Assign minimal permissions: `VM.PowerMgmt` and `VM.Audit`
-3. `Datacenter → Permissions → API Tokens` — generate a token for that user
+1. `Datacenter → Permissions → Users` — create a dedicated user (e.g. `svc-wake@pve`), comment "for wake_lxc_middleware" for easy identification later
+2. `Datacenter → Permissions → Roles` — create a role (e.g. `WakeRole`) with privileges `VM.Audit` and `VM.PowerMgmt`
+3. `Datacenter → Permissions` — click **Add → User Permission**, and assign:
+   - Path: `/` (or scope it down to just the VMs/CTs you want this to control)
+   - User: the user from step 1
+   - Role: the role from step 2
+4. `Datacenter → Permissions → API Tokens` — create a token for that user, Token ID e.g. `WLM Token` (or your preferred ID), comment "for wake_lxc_middleware"
    - Uncheck "Privilege Separation" for simpler permission inheritance
    - Save the token secret immediately — it's shown only once
+
+Prefer the CLI? See [`pve_commands.md`](./pve_commands.md) for the same setup via `pveum`, plus a verification command.
 
 ### 4. Configure environment variables
 ```bash
@@ -147,7 +166,7 @@ Check `docker-compose.yml` and adjust network names/volumes to your setup. Again
 | `containers[].vmid` | yes | Proxmox VMID |
 | `containers[].kind` | no (default `lxc`) | `lxc` or `qemu` — Proxmox's own terms; note it's `qemu`, not `vm` |
 | `containers[].domain` | yes | External hostname; used to look up which container a request is for |
-| `containers[].backend` | no | Internal `https(s)://host:port` of the real app, used only to check the app itself has finished starting (not just that the OS booted). Omit to skip this check. |
+| `containers[].backend` | no | Internal `http(s)://host:port` of the real app, used only to check the app itself has finished starting (not just that the OS booted). Omit to skip this check. |
 | `containers[].stop_minutes` | no | Overrides the global default for this container |
 | `containers[].stop_mode` | no (default `shutdown`) | `shutdown` (graceful) or `stop` (force poweroff) |
 | `containers[].check_interval` | no | Overrides the global default for this container |
@@ -183,6 +202,12 @@ Check `docker-compose.yml` and adjust network names/volumes to your setup. Again
 - **"Connection lost" on the starting page, looping start attempts**: `WAKE_DOMAIN` is missing its own Traefik router, or that router still has `forwardAuth` attached to it. It must be routed directly with no auth middleware.
 - **Watchdog not cancelling a stop timer after an external stop**: check `check_interval` isn't longer than how quickly you need it to react — the watchdog polls `/api2/json/nodes/{node}/lxc/{vmid}/status/current` on that interval.
 - **Circuit breaker open / status checks skipped**: the breaker opens for 5 minutes after a real Proxmox API failure (not for a container being legitimately stopped). Check Proxmox connectivity and token validity if this fires repeatedly.
+- **Verify your Proxmox token directly**, independent of the middleware:
+  ```bash
+  curl -k -H "Authorization: PVEAPIToken=svc-wake@pve!wake=YOUR_TOKEN_VALUE" \
+    https://YOUR_PROXMOX_IP:8006/api2/json/nodes/YOUR_NODE/lxc
+  ```
+  A JSON list of containers confirms the token/permissions are fine and the problem is elsewhere.
 
 ### Manual commands
 - Restart middleware: `systemctl restart wake_lxc_middleware`
@@ -204,7 +229,6 @@ WAKE_DOMAIN (no forwardAuth):
 
 ## 📜 License
 MIT License
-
 
 ## Credits
 itsddpanda for the original project [Wake-LXC](https://github.com/itsddpanda/pub_wake_lxc/tree/main)
