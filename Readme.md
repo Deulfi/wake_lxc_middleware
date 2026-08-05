@@ -23,14 +23,14 @@
 ```bash
 apt update
 apt install -y python3 python3-pip git curl ca-certificates
-pip install -r requirements.txt --break-system-packages
 ```
 
-### 2. Clone the repository
+### 2. Clone the repository and install requirements
 ```bash
 cd /opt/
 git clone https://github.com/Deulfi/wake_lxc_middleware.git
 cd wake_lxc_middleware
+pip install -r requirements.txt --break-system-packages
 ```
 
 ### 3. Create a Proxmox API token
@@ -99,6 +99,8 @@ Description=Wake LXC Middleware
 After=network.target
 
 [Service]
+Environment=BIND_HOST=0.0.0.0
+Environment=BIND_PORT=8080
 EnvironmentFile=/opt/wake_lxc_middleware/.env
 WorkingDirectory=/opt/wake_lxc_middleware
 ExecStart=/usr/local/bin/uvicorn asgi_app:app --host ${BIND_HOST} --port ${BIND_PORT}
@@ -189,7 +191,7 @@ Check `docker-compose.yml` and adjust network names/volumes to your setup. Again
 
 ## 🏗️ Architecture
 ```
-Protected domain (e.g. convertx.pve.lan):
+Protected domain (e.g. myapp.example.com):
   Browser → Traefik → forwardAuth → /auth
     running  → 200 OK → Traefik proxies to the real backend
     stopped  → starts container → 302 redirect → WAKE_DOMAIN
