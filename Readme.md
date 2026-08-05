@@ -145,7 +145,7 @@ Check `docker-compose.yml` and adjust network names/volumes to your setup. Again
 | `containers[].vmid` | yes | Proxmox VMID |
 | `containers[].kind` | no (default `lxc`) | `lxc` or `qemu` — Proxmox's own terms; note it's `qemu`, not `vm` |
 | `containers[].domain` | yes | External hostname; used to look up which container a request is for |
-| `containers[].backend` | no | Internal `host:port` of the real app, used only to check the app itself has finished starting (not just that the OS booted). Omit to skip this check. |
+| `containers[].backend` | no | Internal `https(s)://host:port` of the real app, used only to check the app itself has finished starting (not just that the OS booted). Omit to skip this check. |
 | `containers[].stop_minutes` | no | Overrides the global default for this container |
 | `containers[].stop_mode` | no (default `shutdown`) | `shutdown` (graceful) or `stop` (force poweroff) |
 | `containers[].check_interval` | no | Overrides the global default for this container |
