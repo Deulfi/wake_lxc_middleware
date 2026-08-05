@@ -13,7 +13,7 @@ pveum user add svc-wake@pve --comment "Wake-on-request service"
 2.  Create a minimal custom role (audit+monitor+power only)
 
 ```
-pveum role add WakeRole --privs "VM.Audit,VM.Monitor,VM.PowerMgmt"
+pveum role add WakeRole --privs "VM.Audit,Sys.Audit,VM.PowerMgmt"
 ```
 
 3.  Grant that role ONLY on CT 111
