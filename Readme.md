@@ -182,8 +182,8 @@ Check `docker-compose.yml` and adjust network names/volumes to your setup. Again
 | `PROXMOX_TOKEN_VALUE_FILE` | yes* | Path to a file containing the token secret, as an alternative to `PROXMOX_TOKEN_VALUE` |
 | `PROXMOX_VERIFY_TLS` | no (default `false`) | Verify Proxmox's TLS certificate |
 | `WAKE_DOMAIN` | yes | Dedicated domain for the "starting..." page, routed WITHOUT forwardAuth (see step 6 above) |
-| `CONFIG_PATH` | no (default `config.yaml`) | Full path to `config.yaml`, including the filename |
-| `STATE_FILE` | no | Full path to the state file (where stop timers are saved) |
+| `CONFIG_PATH` | no (default `working directory + config.yaml`) | Full path to `config.yaml`, including the filename |
+| `STATE_FILE` | no (default `working directory + state.json`)| Full path to the state file (stop timers are saved in this file) |
 | `BIND_HOST` | no (default `0.0.0.0`) | Address uvicorn binds to |
 | `BIND_PORT` | no (default `8080`) | Port uvicorn binds to |
 | `LOG_LEVEL` | no (default `INFO`) | `INFO` or `DEBUG` |
