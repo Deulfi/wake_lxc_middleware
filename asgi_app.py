@@ -4,7 +4,9 @@ import logging
 import os
 import time
 from collections import deque
+from html import escape
 from typing import Dict, Optional, Any
+from urllib.parse import urlencode
 
 import httpx
 import yaml
@@ -456,13 +458,32 @@ async def forward_auth(request: Request):
     schedule_stop(container)
     start_watchdog(container)
 
-    target = f"https://{WAKE_DOMAIN}/starting?target={host}"
+    # Remember the ORIGINAL path + query (this is where e.g. a magnet link lives)
+    # so the starting page can send the browser back to exactly that URL once the
+    # container is ready, instead of dumping it on "/".
+    # NOTE: this only works for GET requests. A redirect turns a POST into a GET,
+    # so a POSTed payload can't be preserved this way.
+    original_uri = request.headers.get("x-forwarded-uri", "/")
+    target = "https://{}/starting?{}".format(
+        WAKE_DOMAIN, urlencode({"target": host, "path": original_uri})
+    )
     return RedirectResponse(url=target, status_code=302)
 
 
 @app.get("/starting")
-async def starting_page(target: str):
+async def starting_page(target: str, path: str = "/"):
     """Served on WAKE_DOMAIN only -- never behind forwardAuth."""
+    # Only known domains are allowed (prevents reflected XSS / open redirect).
+    if not get_container_by_domain(target):
+        return JSONResponse(status_code=404, content={"detail": "unknown target"})
+    # The path must be a plain absolute path on the target host, never "//evil.com".
+    if not path.startswith("/") or path.startswith("//"):
+        path = "/"
+
+    # Safe to embed inside a <script> block.
+    target_js = json.dumps(target).replace("<", "\\u003c")
+    dest_js = json.dumps(f"https://{target}{path}").replace("<", "\\u003c")
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -512,7 +533,7 @@ async def starting_page(target: str):
 <body>
   <div class="container" id="main-container">
     <div class="logo">🚀</div>
-    <h1>{target}</h1>
+    <h1>{escape(target)}</h1>
     <div class="spinner"></div>
     <div class="status-text" id="status-text">Checking status...</div>
     <div class="timer" id="timer">Elapsed: 0s</div>
@@ -527,14 +548,16 @@ async def starting_page(target: str):
       timerEl.textContent = `Elapsed: ${{Math.floor((Date.now() - startedAt) / 1000)}}s`;
     }}, 1000);
 
-    const evtSource = new EventSource('/status-stream?target={target}');
+    const evtSource = new EventSource('/status-stream?target=' + encodeURIComponent({target_js}));
     evtSource.onmessage = (event) => {{
       const data = JSON.parse(event.data);
       if (data.message) statusText.textContent = data.message;
       if (data.level === 'error') container.classList.add('error');
       if (data.level === 'ready') {{
         evtSource.close();
-        window.location.href = 'https://{target}/';
+        // Back to the ORIGINAL url (path + query). window.location.hash re-appends
+        // a #fragment, which browsers keep across the 302 but the server never sees.
+        window.location.href = {dest_js} + window.location.hash;
       }}
     }};
     evtSource.onerror = () => {{
