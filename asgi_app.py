@@ -171,11 +171,12 @@ def reset_failures(vmid: str):
 # Proxmox operations
 # ---------------------------------------------------------------------------
 async def check_container_status(vmid: str, kind: str = "lxc") -> bool:
-    """True if running. Only records circuit-breaker failures on real errors,
-    never on a legitimate 'stopped' status."""
-    if not check_circuit_breaker(vmid):
-        logger.warning(f"VMID {vmid}: circuit breaker open, skipping status check.")
-        return False
+    """True if running. Always queries Proxmox for the real status -- the
+    circuit breaker must NOT gate this. If it did, a stale 'not running'
+    belief would persist after any start failure, causing /auth to call
+    start_container() on an already-running LXC, which Proxmox rejects,
+    which re-trips the breaker -- an infinite stuck loop. The breaker only
+    gates start attempts (see /auth), never truth-reads."""
     try:
         client = get_proxmox_client()
         resp = await client.get(f"/api2/json/nodes/{PVE['node']}/{kind}/{vmid}/status/current")
@@ -450,7 +451,9 @@ async def forward_auth(request: Request):
     if not lock.locked():
         async with lock:
             if not await check_container_status(vmid, kind):
-                if await start_container(vmid, kind):
+                if not check_circuit_breaker(vmid):
+                    await emit_status_event(host, "Recent start failures, waiting before retrying...", "error")
+                elif await start_container(vmid, kind):
                     await emit_status_event(host, "Start command sent successfully.")
                 else:
                     await emit_status_event(host, "Failed to send start command -- check Proxmox connectivity.", "error")
