@@ -83,10 +83,21 @@ WAKE_DOMAIN = PVE["wake_domain"]
 # ---------------------------------------------------------------------------
 config: Dict[str, Any] = {}
 DOMAIN_TO_CONTAINER: Dict[str, dict] = {}
+_config_mtime: float = 0.0
 
 
 def load_config() -> dict:
+    """Loads config.yaml. Logs the resolved path once per actual load (initial
+    boot, or a genuine change picked up by reload_config_if_changed) -- not on
+    every request, since _config_mtime is set here too."""
+    global _config_mtime
     path = os.getenv("CONFIG_PATH", "config.yaml")
+    if os.path.isdir(path):
+        raise RuntimeError(
+            f"CONFIG_PATH '{path}' is a directory, not a file. "
+            f"Point it at the actual YAML file, e.g. '{os.path.join(path, 'config.yaml')}'."
+        )
+    logger.info(f"Loading config from: {os.path.abspath(path)} (CONFIG_PATH env var: {os.getenv('CONFIG_PATH') or 'not set, using default'})")
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
     if "global" not in cfg or "containers" not in cfg:
@@ -100,7 +111,22 @@ def load_config() -> dict:
             raise ValueError(f"config.yaml: container {i} missing 'vmid'")
         if "domain" not in c and "domains" not in c:
             raise ValueError(f"config.yaml: container {i} missing 'domain' or 'domains'")
+    _config_mtime = os.path.getmtime(path)
     return cfg
+
+
+def reload_config_if_changed():
+    """Cheap per-request check (a single stat() call) -- reloads only if
+    config.yaml actually changed on disk since the last load."""
+    global config
+    path = os.getenv("CONFIG_PATH", "config.yaml")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return
+    if mtime != _config_mtime:
+        config = load_config()
+        build_domain_map()
 
 
 def build_domain_map():
@@ -428,6 +454,7 @@ async def on_shutdown():
 @app.get("/auth")
 async def forward_auth(request: Request):
     """Traefik ForwardAuth endpoint. Gated by Traefik on protected routers only."""
+    reload_config_if_changed()
     host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
     container = get_container_by_domain(host)
 
@@ -611,4 +638,7 @@ async def healthz():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # access_log off: every asset request on a single page load otherwise
+    # produces its own "GET /auth 200 OK" line; the app's own INFO logs
+    # already cover every meaningful event (start/stop/errors).
+    uvicorn.run(app, host="0.0.0.0", port=8080, access_log=False)
