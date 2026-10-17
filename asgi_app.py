@@ -85,6 +85,12 @@ config: Dict[str, Any] = {}
 DOMAIN_TO_CONTAINER: Dict[str, dict] = {}
 _config_mtime: float = 0.0
 
+# vmid(str) -> container dict, discovered from Proxmox notes (wake.* labels).
+# In-memory only -- never written back to config.yaml. An entry here is
+# merged in only if config.yaml doesn't already define that vmid; the
+# static config always wins on conflict.
+DISCOVERED_CONTAINERS: Dict[str, dict] = {}
+
 
 def load_config() -> dict:
     """Loads config.yaml. Logs the resolved path once per actual load (initial
@@ -102,8 +108,8 @@ def load_config() -> dict:
         cfg = yaml.safe_load(f)
     if "global" not in cfg or "containers" not in cfg:
         raise ValueError("config.yaml must have 'global' and 'containers' sections")
-    if "stop_minutes" not in cfg["global"]:
-        raise ValueError("config.yaml: global.stop_minutes is required")
+    if "shutdown_minutes" not in cfg["global"]:
+        raise ValueError("config.yaml: global.shutdown_minutes is required")
     if "check_interval" not in cfg["global"]:
         raise ValueError("config.yaml: global.check_interval is required")
     for i, c in enumerate(cfg["containers"]):
@@ -129,10 +135,19 @@ def reload_config_if_changed():
         build_domain_map()
 
 
+def merged_containers() -> Dict[str, dict]:
+    """vmid(str) -> container dict, config.yaml's static list layered on top
+    of DISCOVERED_CONTAINERS so a vmid defined in both uses the yaml entry."""
+    merged: Dict[str, dict] = {vmid: c for vmid, c in DISCOVERED_CONTAINERS.items()}
+    for c in config.get("containers", []):
+        merged[str(c["vmid"])] = c
+    return merged
+
+
 def build_domain_map():
     global DOMAIN_TO_CONTAINER
     DOMAIN_TO_CONTAINER = {}
-    for c in config["containers"]:
+    for c in merged_containers().values():
         domains = c.get("domains") or [c["domain"]]
         for d in domains:
             DOMAIN_TO_CONTAINER[d] = c
@@ -143,10 +158,155 @@ def get_container_by_domain(domain: str) -> Optional[dict]:
 
 
 def get_container_by_vmid(vmid: str) -> Optional[dict]:
-    for c in config.get("containers", []):
-        if str(c["vmid"]) == str(vmid):
-            return c
+    return merged_containers().get(str(vmid))
+
+
+def resolve_stop(container: dict):
+    """(minutes, mode). A container's own 'stop_minutes' opts into a hard
+    poweroff after that many idle minutes and wins if 'shutdown_minutes' is
+    also set. 'shutdown_minutes' alone gets a graceful shutdown after that
+    many minutes. With neither set, falls back to the global
+    shutdown_minutes default (graceful)."""
+    if "stop_minutes" in container:
+        return container["stop_minutes"], "stop"
+    if "shutdown_minutes" in container:
+        return container["shutdown_minutes"], "shutdown"
+    return config["global"]["shutdown_minutes"], "shutdown"
+
+# ---------------------------------------------------------------------------
+# Discovery: containers that opt in via Proxmox notes/description instead of
+# config.yaml. One line per flag, "wake.<key>=<value>", e.g.:
+#   wake.enable=true
+#   wake.domain=aiostreams.pve.lan
+#   wake.port=3000
+#   wake.shutdown_minutes=30
+# This is a separate, wake_lxc_middleware-only convention -- NOT the
+# traefik-proxmox-provider's "traefik.*" labels. Those assume a live,
+# running container (they fall back to the /interfaces endpoint), which
+# doesn't hold here: a container we're about to wake is, by definition,
+# not necessarily running yet.
+# ---------------------------------------------------------------------------
+def parse_wake_labels(description: str) -> Dict[str, str]:
+    labels: Dict[str, str] = {}
+    for line in (description or "").splitlines():
+        line = line.strip()
+        if not line.startswith("wake.") or "=" not in line:
+            continue  # ignores blank lines, comments, and any other prefix (e.g. traefik.*)
+        key, _, value = line.partition("=")
+        labels[key[len("wake."):].strip()] = value.strip()
+    return labels
+
+
+def parse_static_ip(net0: str) -> Optional[str]:
+    """Extracts the ip= value from a netN config line, e.g.
+    'name=eth0,bridge=vmbr0,gw=10.0.100.1,ip=10.0.100.128/24,type=veth'.
+    Returns None for 'ip=dhcp' or a missing/absent net0."""
+    for part in (net0 or "").split(","):
+        if part.startswith("ip="):
+            value = part[len("ip="):]
+            return None if value.lower() == "dhcp" else value.split("/")[0]
     return None
+
+
+_ipam_cache: Optional[list] = None
+_ipam_cache_ts: float = 0.0
+_IPAM_CACHE_SECONDS = 30  # one cluster-wide call covers every vmid's lookup for this long
+
+
+async def get_ipam_ip(vmid: str) -> Optional[str]:
+    """Looks up a DHCP-via-IPAM address for vmid from /cluster/sdn/ipam.
+    Requires the API token to have SDN.Audit (VM.Audit alone doesn't cover
+    this cluster-level endpoint)."""
+    global _ipam_cache, _ipam_cache_ts
+    if _ipam_cache is None or time.time() - _ipam_cache_ts > _IPAM_CACHE_SECONDS:
+        try:
+            resp = await get_proxmox_client().get("/api2/json/cluster/sdn/ipam")
+            resp.raise_for_status()
+            _ipam_cache = resp.json().get("data", [])
+            _ipam_cache_ts = time.time()
+        except Exception as e:
+            logger.warning(f"IPAM lookup failed: {e}")
+            return None
+    for entry in _ipam_cache or []:
+        if str(entry.get("vmid")) == str(vmid):
+            return entry.get("ip")
+    return None
+
+
+async def resolve_backend_url(vmid: str, labels: Dict[str, str], net0: str) -> Optional[str]:
+    """Resolution order: explicit wake.backend/host override (cheapest, no
+    extra call) -> static IP already in hand from the same /config response
+    (cheap) -> IPAM lookup (only for a DHCP-via-IPAM container, since that's
+    the only case where neither of the above can answer)."""
+    if "backend" in labels:
+        return labels["backend"]
+    port = labels.get("port")
+    if not port:
+        return None
+    if "host" in labels:
+        return f"http://{labels['host']}:{port}"
+    ip = parse_static_ip(net0) or await get_ipam_ip(vmid)
+    return f"http://{ip}:{port}" if ip else None
+
+
+_discovery_task: Optional[asyncio.Task] = None
+
+
+async def run_discovery_once():
+    """One discovery pass. Finds LXCs/VMs with wake.enable=true in their
+    notes and merges them into DOMAIN_TO_CONTAINER -- in memory only,
+    config.yaml is never touched."""
+    global DISCOVERED_CONTAINERS
+    client = get_proxmox_client()
+    found: Dict[str, dict] = {}
+    for kind, list_path in (("lxc", "lxc"), ("qemu", "qemu")):
+        resp = await client.get(f"/api2/json/nodes/{PVE['node']}/{list_path}")
+        resp.raise_for_status()
+        for entry in resp.json().get("data", []):
+            vmid = str(entry["vmid"])
+            try:
+                cfg_resp = await client.get(f"/api2/json/nodes/{PVE['node']}/{kind}/{vmid}/config")
+                cfg_resp.raise_for_status()
+                cfg_data = cfg_resp.json().get("data", {})
+                labels = parse_wake_labels(cfg_data.get("description", ""))
+                if labels.get("enable", "").lower() != "true":
+                    continue
+                if "domain" not in labels:
+                    logger.warning(f"VMID {vmid}: wake.enable=true but no wake.domain set, skipping.")
+                    continue
+                container = {
+                    "vmid": int(vmid),
+                    "kind": kind,
+                    "domain": labels["domain"],
+                    "backend": await resolve_backend_url(vmid, labels, cfg_data.get("net0", "")),
+                }
+                if "stop_minutes" in labels:
+                    container["stop_minutes"] = float(labels["stop_minutes"])
+                if "shutdown_minutes" in labels:
+                    container["shutdown_minutes"] = float(labels["shutdown_minutes"])
+                found[vmid] = container
+            except Exception as e:
+                # One container's config being unreadable (permissions,
+                # transient API error) shouldn't abort discovery for every
+                # other container in this pass.
+                logger.warning(f"VMID {vmid}: discovery check failed, skipping this pass: {e}")
+    DISCOVERED_CONTAINERS = found
+    build_domain_map()
+    logger.info(f"Discovery: {len(found)} wake-enabled container(s) found via Proxmox notes.")
+
+
+async def discover_containers_loop():
+    """Background loop (interval: global.discovery_interval, default 60s).
+    The first pass runs synchronously in on_startup before this loop starts,
+    so discovered containers are already known in time for state.json resume."""
+    while True:
+        await asyncio.sleep(config["global"].get("discovery_interval", 60))
+        try:
+            await run_discovery_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Discovery loop failed: {e}")
 
 # ---------------------------------------------------------------------------
 # Proxmox API client (shared, pooled — not recreated per request)
@@ -338,8 +498,8 @@ def schedule_stop(container: dict, initial_delay_seconds: Optional[float] = None
     if vmid in active_timers:
         active_timers[vmid].cancel()
 
-    stop_minutes = container.get("stop_minutes", config["global"]["stop_minutes"])
-    delay = initial_delay_seconds if initial_delay_seconds is not None else stop_minutes * 60
+    minutes, stop_mode = resolve_stop(container)
+    delay = initial_delay_seconds if initial_delay_seconds is not None else minutes * 60
     _stop_deadlines[vmid] = time.time() + delay
     asyncio.create_task(save_state())
 
@@ -349,7 +509,7 @@ def schedule_stop(container: dict, initial_delay_seconds: Optional[float] = None
             await asyncio.sleep(delay)
             logger.info(f"VMID {vmid}: stop timer fired.")
             if await check_container_status(vmid, container.get("kind", "lxc")):
-                await shutdown_container(vmid, container.get("kind", "lxc"), container.get("stop_mode", "shutdown"))
+                await shutdown_container(vmid, container.get("kind", "lxc"), stop_mode)
             else:
                 logger.info(f"VMID {vmid}: already stopped, nothing to do.")
         except asyncio.CancelledError:
@@ -369,8 +529,9 @@ def start_watchdog(container: dict):
     if vmid in watchdog_tasks:
         watchdog_tasks[vmid].cancel()
 
-    check_interval = container.get("check_interval", config["global"]["check_interval"])
-    interval_sec = check_interval * 60
+    # Global only -- a per-container override wasn't worth the complexity
+    # given how cheap this check is.
+    interval_sec = config["global"]["check_interval"] * 60
 
     async def _loop():
         this_task = asyncio.current_task()
@@ -403,11 +564,20 @@ app = FastAPI(title="wake_lxc_middleware")
 
 @app.on_event("startup")
 async def on_startup():
-    global config
+    global config, _discovery_task
     config = load_config()
     build_domain_map()
     logger.info(f"Loaded {len(config['containers'])} container(s), {len(DOMAIN_TO_CONTAINER)} domain(s).")
     logger.info(f"WAKE_DOMAIN = {WAKE_DOMAIN} (must be routed WITHOUT forwardAuth in Traefik)")
+
+    # One synchronous discovery pass before state-resume, so a discovered
+    # (notes-based) container's pending stop timer isn't dropped just
+    # because discovery hadn't run yet. The periodic loop takes over after.
+    try:
+        await run_discovery_once()
+    except Exception as e:
+        logger.error(f"Initial discovery pass failed: {e}")
+    _discovery_task = asyncio.create_task(discover_containers_loop())
 
     restored = load_state()
     now = time.time()
@@ -418,8 +588,9 @@ async def on_startup():
         remaining = deadline - now
         if remaining <= 0:
             logger.info(f"VMID {vmid}: stop was overdue while offline, stopping now.")
+            _, stop_mode = resolve_stop(container)
             asyncio.create_task(shutdown_container(
-                vmid, container.get("kind", "lxc"), container.get("stop_mode", "shutdown")
+                vmid, container.get("kind", "lxc"), stop_mode
             ))
         else:
             logger.info(f"VMID {vmid}: resuming stop timer, {remaining/60:.1f} min remaining.")
@@ -436,6 +607,10 @@ async def on_shutdown():
     # wait for the cancellations to fully land, then restore the snapshot
     # and save it LAST so it's guaranteed to be the final write.
     preserved = dict(_stop_deadlines)
+
+    if _discovery_task:
+        _discovery_task.cancel()
+        await asyncio.gather(_discovery_task, return_exceptions=True)
 
     tasks = list(active_timers.values()) + list(watchdog_tasks.values())
     for t in tasks:
