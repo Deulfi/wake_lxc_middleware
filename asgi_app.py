@@ -30,6 +30,10 @@ if not DEBUG_MODE:
     for name in ["httpx", "httpcore"]:
         logging.getLogger(name).setLevel(logging.WARNING)
 
+# Disabled via the logger, not uvicorn.run(access_log=False) -- that flag only
+# applies to the `python asgi_app.py` entry point, not `uvicorn asgi_app:app`.
+logging.getLogger("uvicorn.access").disabled = True
+
 # ---------------------------------------------------------------------------
 # Env var validation (with *_FILE / Docker-secrets support)
 # ---------------------------------------------------------------------------
@@ -77,6 +81,18 @@ def validate_environment() -> dict:
 
 PVE = validate_environment()
 WAKE_DOMAIN = PVE["wake_domain"]
+
+# Fallback domain_template, derived from WAKE_DOMAIN's own suffix
+# (e.g. WAKE_DOMAIN=wake.pve.lan -> "{hostname}.pve.lan"). Used only when
+# global.domain_template is not set explicitly.
+_WAKE_DOMAIN_SUFFIX = WAKE_DOMAIN.split(".", 1)[1] if "." in WAKE_DOMAIN else None
+
+
+def resolve_domain_template() -> Optional[str]:
+    explicit = config.get("global", {}).get("domain_template")
+    if explicit:
+        return explicit
+    return f"{{hostname}}.{_WAKE_DOMAIN_SUFFIX}" if _WAKE_DOMAIN_SUFFIX else None
 
 # ---------------------------------------------------------------------------
 # Config file
@@ -210,19 +226,28 @@ def parse_static_ip(net0: str) -> Optional[str]:
 
 _ipam_cache: Optional[list] = None
 _ipam_cache_ts: float = 0.0
-_IPAM_CACHE_SECONDS = 30  # one cluster-wide call covers every vmid's lookup for this long
+_IPAM_CACHE_SECONDS = 30  # covers every vmid's lookup for this long before re-fetching
 
 
 async def get_ipam_ip(vmid: str) -> Optional[str]:
-    """Looks up a DHCP-via-IPAM address for vmid from /cluster/sdn/ipam.
-    Requires the API token to have SDN.Audit (VM.Audit alone doesn't cover
-    this cluster-level endpoint)."""
+    """Looks up a DHCP-via-IPAM address for vmid: GET /cluster/sdn/ipams lists
+    the configured IPAM plugin(s), then GET /cluster/sdn/ipams/{ipam}/status
+    returns that plugin's IP records. Requires the API token to have SDN.Audit."""
     global _ipam_cache, _ipam_cache_ts
     if _ipam_cache is None or time.time() - _ipam_cache_ts > _IPAM_CACHE_SECONDS:
         try:
-            resp = await get_proxmox_client().get("/api2/json/cluster/sdn/ipam")
-            resp.raise_for_status()
-            _ipam_cache = resp.json().get("data", [])
+            client = get_proxmox_client()
+            ipams_resp = await client.get("/api2/json/cluster/sdn/ipams")
+            ipams_resp.raise_for_status()
+            records: list = []
+            for ipam in ipams_resp.json().get("data", []):
+                ipam_id = ipam.get("ipam")
+                if not ipam_id:
+                    continue
+                status_resp = await client.get(f"/api2/json/cluster/sdn/ipams/{ipam_id}/status")
+                status_resp.raise_for_status()
+                records.extend(status_resp.json().get("data", []))
+            _ipam_cache = records
             _ipam_cache_ts = time.time()
         except Exception as e:
             logger.warning(f"IPAM lookup failed: {e}")
@@ -237,7 +262,11 @@ async def resolve_backend_url(vmid: str, labels: Dict[str, str], net0: str) -> O
     """Resolution order: explicit wake.backend/host override (cheapest, no
     extra call) -> static IP already in hand from the same /config response
     (cheap) -> IPAM lookup (only for a DHCP-via-IPAM container, since that's
-    the only case where neither of the above can answer)."""
+    the only case where neither of the above can answer).
+
+    A None return with 'port' set means resolution genuinely failed (not the
+    same as a container that never asked for a backend) -- worth a warning,
+    since the readiness probe is then skipped."""
     if "backend" in labels:
         return labels["backend"]
     port = labels.get("port")
@@ -246,7 +275,14 @@ async def resolve_backend_url(vmid: str, labels: Dict[str, str], net0: str) -> O
     if "host" in labels:
         return f"http://{labels['host']}:{port}"
     ip = parse_static_ip(net0) or await get_ipam_ip(vmid)
-    return f"http://{ip}:{port}" if ip else None
+    if not ip:
+        logger.warning(
+            f"VMID {vmid}: wake.port={port} set but no IP could be resolved (no static "
+            f"net0 IP, IPAM lookup empty) -- readiness probing will be skipped for this "
+            f"container until wake.host or wake.backend is set, or an IP resolves."
+        )
+        return None
+    return f"http://{ip}:{port}"
 
 
 _discovery_task: Optional[asyncio.Task] = None
@@ -271,13 +307,23 @@ async def run_discovery_once():
                 labels = parse_wake_labels(cfg_data.get("description", ""))
                 if labels.get("enable", "").lower() != "true":
                     continue
-                if "domain" not in labels:
-                    logger.warning(f"VMID {vmid}: wake.enable=true but no wake.domain set, skipping.")
+                domain = labels.get("domain")
+                if not domain:
+                    # Only LXCs have an OS-level hostname; QEMU VMs have none in
+                    # Proxmox's config (just a display name) and must set wake.domain.
+                    domain_template = resolve_domain_template()
+                    hostname = cfg_data.get("hostname") if kind == "lxc" else None
+                    if domain_template and hostname:
+                        domain = domain_template.format(hostname=hostname)
+                if not domain:
+                    logger.warning(f"VMID {vmid}: wake.enable=true but no domain could be determined "
+                                    f"(no wake.domain, and no usable domain_template [explicit or derived "
+                                    f"from WAKE_DOMAIN] + hostname), skipping.")
                     continue
                 container = {
                     "vmid": int(vmid),
                     "kind": kind,
-                    "domain": labels["domain"],
+                    "domain": domain,
                     "backend": await resolve_backend_url(vmid, labels, cfg_data.get("net0", "")),
                 }
                 if "stop_minutes" in labels:
@@ -569,6 +615,10 @@ async def on_startup():
     build_domain_map()
     logger.info(f"Loaded {len(config['containers'])} container(s), {len(DOMAIN_TO_CONTAINER)} domain(s).")
     logger.info(f"WAKE_DOMAIN = {WAKE_DOMAIN} (must be routed WITHOUT forwardAuth in Traefik)")
+    effective_template = resolve_domain_template()
+    if effective_template:
+        source = "global.domain_template" if config.get("global", {}).get("domain_template") else "derived from WAKE_DOMAIN"
+        logger.info(f"Discovery domain_template: '{effective_template}' ({source})")
 
     # One synchronous discovery pass before state-resume, so a discovered
     # (notes-based) container's pending stop timer isn't dropped just
@@ -634,7 +684,14 @@ async def forward_auth(request: Request):
     container = get_container_by_domain(host)
 
     if not container:
-        return JSONResponse(status_code=404, content={"detail": f"No container mapped for host: {host}"})
+        return JSONResponse(status_code=404, content={
+            "detail": (
+                f"No container mapped for host: {host}. Checked config.yaml's containers list "
+                f"and {len(DISCOVERED_CONTAINERS)} wake-enabled container(s) found via Proxmox notes. "
+                f"Add it to config.yaml, or set wake.enable=true and wake.domain={host} in its "
+                f"Proxmox notes and wait for the next discovery pass."
+            )
+        })
 
     vmid = str(container["vmid"])
     kind = container.get("kind", "lxc")

@@ -8,3 +8,4 @@
 .env
 config.yaml
 state.json
+__pycache__/

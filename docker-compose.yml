@@ -8,14 +8,17 @@ services:
     restart: unless-stopped
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-      - ./logs:/app/logs:rw
+      - ./data:/app/data:rw   # state.json persists here (stop deadlines survive container recreate)
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
       - ./secrets/proxmox_token_value.txt:/run/secrets/proxmox_token_value:ro
-    
+
+    environment:
+      - STATE_FILE=/app/data/state.json
+
     env_file:
       - .env
-    
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 120s

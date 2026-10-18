@@ -10,6 +10,10 @@ global:
   shutdown_minutes: 30   # REQUIRED: graceful shutdown N minutes after last access
   check_interval: 5      # REQUIRED: watchdog poll interval, in minutes (global only)
   discovery_interval: 60 # OPTIONAL: seconds between Proxmox-notes discovery passes (default 60)
+  # OPTIONAL: domain for a discovered LXC without wake.domain, built from its
+  # hostname (LXC only -- QEMU VMs must set wake.domain explicitly).
+  # Falls back to a template derived from WAKE_DOMAIN when not set.
+  # domain_template: "{hostname}.sub.domain.name"
 
 containers:
   - vmid: 150
