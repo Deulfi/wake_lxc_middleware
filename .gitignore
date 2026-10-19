@@ -1,11 +1,2 @@
-/_archive
-/asgi_app_original.py
-/logs
-/test_services.py
-.aider*
-.env
-.env
-.env
-config.yaml
+tmp/
 state.json
-__pycache__/

@@ -1,0 +1,33 @@
+displayName: Wake LXC
+type: middleware
+import: github.com/Deulfi/wake_lxc_middleware
+summary: 'Starts Proxmox LXC/QEMU guests on first request and stops them after an idle period'
+testData:
+  apiEndpoint: "https://proxmox.example.com:8006"
+  apiTokenId: "svc-wake@pve!wake"
+  apiToken: "00000000-0000-0000-0000-000000000000"
+  apiValidateSSL: "false"
+  apiLogging: "info"
+  nodeName: "pve"
+  discoveryInterval: "60s"
+  checkInterval: "5m"
+  shutdownMinutes: "30"
+  domainTemplate: "{hostname}.pve.lan"
+  stateFile: ""
+
+# Sample middleware configuration
+http:
+  middlewares:
+    wake:
+      plugin:
+        wake-lxc:
+          apiEndpoint: "https://proxmox.example.com:8006"
+          apiTokenId: "svc-wake@pve!wake"
+          apiToken: "00000000-0000-0000-0000-000000000000"
+          apiValidateSSL: "false"
+          apiLogging: "info"
+          nodeName: "pve"
+          discoveryInterval: "60s"
+          checkInterval: "5m"
+          shutdownMinutes: "30"
+          domainTemplate: "{hostname}.pve.lan"
