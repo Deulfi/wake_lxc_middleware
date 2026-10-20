@@ -6,8 +6,8 @@ A Traefik middleware plugin that wakes idle Proxmox LXC containers and QEMU VMs 
 
 - **Auto-Wake**: Starts a stopped container on the first request to its domain.
 - **Starting page**: While a container boots, the client lands on a progress page that reloads when the app is up.
-- **Auto-Stop**: Stops the container after an idle window (graceful `shutdown`, or hard `stop` via `wake.stop_minutes`).
-- **Auto-Discovery**: Containers opt in via `wake.*` labels in their Proxmox notes — no per-container config file.
+- **Auto-Stop**: Stops the container after an idle window.
+- **Auto-Discovery**: Containers opt in via labels in their Proxmox notes.
 
 ## How it works
 
@@ -20,14 +20,14 @@ Request → Traefik router (Host rule)
 
 1. Traefik routes the request to the `wake-lxc` middleware (via a `Host` rule per domain).
 2. If the container is running, the middleware lets the request through — Traefik proxies it to the backend. If it's stopped, the middleware sends a Proxmox start command and serves the starting page (which polls `__wake__/status` until ready, then reloads).
-3. An idle timer stops the container after inactivity (graceful `shutdown`, or hard `stop` via `wake.stop_minutes`).
+3. An idle timer stops the container after inactivity (graceful `shutdown`, or hard `stop`).
 
 A watchdog cancels a pending stop if the container is stopped externally; a circuit breaker gates repeated start attempts when the API is flaky.
 
 ## Prerequisites
 
 - Proxmox VE (8.x)
-- Traefik (v2 or v3) with the plugin loader enabled
+- Traefik (v2 or v3) with the plugin loader enabled (default)
 - LXC/QEMU containers running your services
 
 ## Installation
@@ -100,7 +100,10 @@ A container opts in by adding `wake.*` lines to its Proxmox notes/description:
 wake.enable=true
 wake.domain=n8n.sub.domain.name
 wake.port=5678
+wake.host=10.0.0.5
+wake.backend=http://10.0.0.5:5678
 wake.shutdown_minutes=30
+wake.stop_minutes=30
 ```
 
 | Label | Type | Description |

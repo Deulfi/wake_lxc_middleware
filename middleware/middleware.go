@@ -43,21 +43,13 @@ func CreateConfig() *Config {
 	}
 }
 
-// Middleware is the wake-lxc plugin middleware.
-//
-// A single Middleware instance is shared across every Traefik reload that
-// targets the same apiEndpoint+nodeName (see instanceRegistry below), so its
-// background goroutines (discoveryLoop, per-container watchdogs) are started
-// exactly once regardless of how often Traefik calls New. next is therefore
-// swapped via atomic.Value instead of being a plain field: ServeHTTP reads it
-// on every request without a lock, while a concurrent New call on a reload
-// may be replacing it from another instance of this plugin.
-type Middleware struct {
-	next    atomic.Value // holds http.Handler
-	name    string
+// SharedState is the discovery/state machinery shared by every Middleware
+// wrapper that targets the same apiEndpoint+nodeName. It is created once
+// (see instanceRegistry) and its background goroutines (discoveryLoop,
+// per-container watchdogs) run for the process lifetime.
+type SharedState struct {
 	client  *internal.ProxmoxClient
-
-	nodeName          string
+	nodeName string
 	discoveryInterval time.Duration
 	checkInterval     time.Duration
 	shutdownMinutes   float64
@@ -74,6 +66,17 @@ type Middleware struct {
 	ipamCache   map[string]string
 	ipamCacheAt time.Time
 	probeClient *http.Client
+}
+
+// Middleware is the per-router wrapper that Traefik calls ServeHTTP on.
+// Each router gets its own Middleware instance (and therefore its own next
+// handler), but they all share the same SharedState for discovery and
+// stop/start state. This is what fixes the redirect-to-wrong-backend bug:
+// the next handler is no longer overwritten by a sibling router's reload.
+type Middleware struct {
+	shared *SharedState
+	next   atomic.Value // holds http.Handler, per-router
+	name   string
 }
 
 // container is one wake-enabled Proxmox VM/container.
@@ -159,7 +162,7 @@ func nodeStop(node string) *nodeStopState {
 	return ns
 }
 
-// instanceRegistry holds the one live Middleware per apiEndpoint+nodeName,
+// instanceRegistry holds the one live SharedState per apiEndpoint+nodeName,
 // at package level so it survives Traefik re-instantiating the plugin.
 //
 // Without this, every New call (Traefik calls it on every dynamic-config
@@ -168,32 +171,30 @@ func nodeStop(node string) *nodeStopState {
 // per-container watchdogs. On Traefik v3 the old instance's ctx is
 // cancelled on reload so those goroutines exit cleanly; on Traefik v2 it is
 // not, so they leak forever, each one polling the Proxmox API on its own
-// schedule. Reusing the instance removes the dependency on that behavior
+// schedule. Reusing the SharedState removes the dependency on that behavior
 // entirely — it is then correct on any Traefik version.
 //
-// Only next (the live handler chain) and the cheap, non-background-affecting
-// scalars (name, checkInterval, shutdownMinutes, domainTemplate, stateFile)
-// are refreshed on reuse. apiToken/apiEndpoint/apiValidateSSL/apiLogging and
-// discoveryInterval are intentionally NOT hot-swapped — changing Proxmox
-// credentials or the discovery interval still requires a real Traefik
-// restart to take effect, since the client and the discovery ticker are
-// already running. That's a deliberate trade-off to keep the reuse path
-// simple and race-free; document it if it surprises you.
+// Only the cheap, non-background-affecting scalars (checkInterval,
+// shutdownMinutes, domainTemplate, stateFile) are refreshed on reuse.
+// apiToken/apiEndpoint/apiValidateSSL/apiLogging and discoveryInterval are
+// intentionally NOT hot-swapped — changing Proxmox credentials or the
+// discovery interval still requires a real Traefik restart to take effect,
+// since the client and the discovery ticker are already running.
 var instanceRegistry = struct {
 	sync.Mutex
-	byKey map[string]*Middleware
-}{byKey: make(map[string]*Middleware)}
+	byKey map[string]*SharedState
+}{byKey: make(map[string]*SharedState)}
 
 func registryKey(apiEndpoint, nodeName string) string {
 	return apiEndpoint + "|" + nodeName
 }
 
-// New creates (or reuses) the middleware. On the first call for a given
-// apiEndpoint+nodeName it validates config, runs a first discovery pass
-// (error → log, don't fail), resumes the stop-timer state file, and starts
-// the background discovery loop. On a later call for the same
-// apiEndpoint+nodeName (a Traefik reload) it reuses the existing instance
-// instead, so no new background goroutines are started.
+// New creates (or reuses) the SharedState and returns a fresh per-router
+// Middleware wrapper. The SharedState (discovery loop, watchdogs, stop
+// timers) is shared across all routers targeting the same apiEndpoint+
+// nodeName; the Middleware wrapper (next handler) is per-router, so each
+// router's backend handler is independent and never overwritten by a
+// sibling router's reload.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (*Middleware, error) {
 	if config.ApiEndpoint == "" {
 		return nil, fmt.Errorf("apiEndpoint is required")
@@ -252,69 +253,57 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (*
 		shutdownMinutes = f
 	}
 
-	// Reuse an existing instance for this apiEndpoint+nodeName if one is
-	// already running (a Traefik reload, not a true process restart). This
-	// is what avoids starting a second discoveryLoop/watchdog set — see the
-	// instanceRegistry doc comment above.
+	// Get or create the shared state for this apiEndpoint+nodeName.
 	key := registryKey(config.ApiEndpoint, config.NodeName)
 	instanceRegistry.Lock()
-	if existing, ok := instanceRegistry.byKey[key]; ok {
-		instanceRegistry.Unlock()
-
-		existing.next.Store(next)
-		existing.mu.Lock()
-		existing.name = name
-		existing.checkInterval = checkInterval
-		existing.shutdownMinutes = shutdownMinutes
-		existing.domainTemplate = config.DomainTemplate
-		existing.stateFile = config.StateFile
-		existing.mu.Unlock()
-
-		log.Printf("wake-lxc: reusing existing middleware instance for %s (reload, not a restart)", key)
-		return existing, nil
+	shared, ok := instanceRegistry.byKey[key]
+	if !ok {
+		shared = &SharedState{
+			client:              internal.NewProxmoxClient(config.ApiEndpoint, config.ApiTokenId, config.ApiToken, validateSSL, logLevel),
+			nodeName:            config.NodeName,
+			discoveryInterval:   discoveryInterval,
+			checkInterval:       checkInterval,
+			shutdownMinutes:     shutdownMinutes,
+			domainTemplate:      config.DomainTemplate,
+			stateFile:           config.StateFile,
+			domains:             make(map[string]*container),
+			byVMID:              make(map[uint64]*container),
+			starting:            make(map[string]*startState),
+			startLocks:          make(map[string]*tryLock),
+			watchdogs:           make(map[string]struct{}),
+			breakers:            make(map[string]time.Time),
+			ipamCache:           make(map[string]string),
+			probeClient:         &http.Client{Timeout: 2 * time.Second},
+		}
+		// Register before the discovery pass so a concurrent New for the
+		// same key can never create a second SharedState.
+		instanceRegistry.byKey[key] = shared
+	} else {
+		// Refresh the cheap scalars on reload.
+		shared.mu.Lock()
+		shared.checkInterval = checkInterval
+		shared.shutdownMinutes = shutdownMinutes
+		shared.domainTemplate = config.DomainTemplate
+		shared.stateFile = config.StateFile
+		shared.mu.Unlock()
 	}
 	instanceRegistry.Unlock()
 
-	client := internal.NewProxmoxClient(config.ApiEndpoint, config.ApiTokenId, config.ApiToken, validateSSL, logLevel)
-
-	m := &Middleware{
-		name:              name,
-		client:            client,
-		nodeName:          config.NodeName,
-		discoveryInterval: discoveryInterval,
-		checkInterval:     checkInterval,
-		shutdownMinutes:   shutdownMinutes,
-		domainTemplate:    config.DomainTemplate,
-		stateFile:         config.StateFile,
-		domains:           make(map[string]*container),
-		byVMID:            make(map[uint64]*container),
-		starting:          make(map[string]*startState),
-		startLocks:        make(map[string]*tryLock),
-		watchdogs:         make(map[string]struct{}),
-		breakers:          make(map[string]time.Time),
-		ipamCache:         make(map[string]string),
-		probeClient:       &http.Client{Timeout: 2 * time.Second},
-	}
+	// Always return a fresh per-router wrapper.
+	m := &Middleware{shared: shared, name: name}
 	m.next.Store(next)
-	// Register before the discovery pass so a concurrent New for the same
-	// key can never create a second instance.
-	instanceRegistry.Lock()
-	instanceRegistry.byKey[key] = m
-	instanceRegistry.Unlock()
 
-	// First discovery pass (error → log, don't fail Traefik startup).
-	if err := m.discover(ctx); err != nil {
-		log.Printf("wake-lxc: initial discovery pass failed: %v", err)
+	// First discovery pass + state resume + background loop only on first
+	// creation (the SharedState was just created, not reused).
+	if !ok {
+		if err := shared.discover(ctx); err != nil {
+			log.Printf("wake-lxc: initial discovery pass failed: %v", err)
+		}
+		if config.StateFile != "" {
+			shared.loadState(ctx)
+		}
+		go shared.discoveryLoop(context.Background())
 	}
-
-	// State resume.
-	if config.StateFile != "" {
-		m.loadState(ctx)
-	}
-
-	// Background discovery loop (process-lifetime; the Traefik ctx is only
-	// for the initial pass above so it can be cancelled during startup).
-	go m.discoveryLoop(context.Background())
 
 	return m, nil
 }
@@ -322,44 +311,44 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (*
 // ServeHTTP is the request path.
 func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	host := strings.ToLower(req.Host)
-	c := m.lookup(host)
+	c := m.shared.lookup(host)
 	if c == nil {
 		m.write404(rw)
 		return
 	}
 	if req.URL.Path == "/__wake__/status" {
-		m.writeStatus(rw, c)
+		m.shared.writeStatus(rw, c)
 		return
 	}
-	if m.isRunning(c) {
-		m.clearStarting(c)
-		m.scheduleStop(c)
-		m.ensureWatchdog(c)
+	if m.shared.isRunning(c) {
+		m.shared.clearStarting(c)
+		m.shared.scheduleStop(c)
+		m.shared.ensureWatchdog(c)
 		m.next.Load().(http.Handler).ServeHTTP(rw, req)
 		return
 	}
-	m.ensureStartCycle(c)
-	m.ensureWatchdog(c)
+	m.shared.ensureStartCycle(c)
+	m.shared.ensureWatchdog(c)
 	m.serveStartingPage(rw, c)
 }
 
-func (m *Middleware) lookup(host string) *container {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.domains[host]
+func (s *SharedState) lookup(host string) *container {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.domains[host]
 }
 
-func (m *Middleware) vmidKey(c *container) string {
+func (s *SharedState) vmidKey(c *container) string {
 	return strconv.FormatInt(int64(c.vmid), 10)
 }
 
 // isRunning checks the container's Proxmox status. Error → false (records a
 // failure); running → true (resets failures); stopped → false.
-func (m *Middleware) isRunning(c *container) bool {
-	status, err := m.client.GetStatus(context.Background(), m.nodeName, c.kind, c.vmid)
+func (s *SharedState) isRunning(c *container) bool {
+	status, err := s.client.GetStatus(context.Background(), s.nodeName, c.kind, c.vmid)
 	if err != nil {
 		log.Printf("wake-lxc: VMID %d: status check failed: %v", c.vmid, err)
-		m.recordFailure(c)
+		s.recordFailure(c)
 		return false
 	}
 	if status != c.lastStatus {
@@ -367,112 +356,112 @@ func (m *Middleware) isRunning(c *container) bool {
 		c.lastStatus = status
 	}
 	if status == "running" {
-		m.resetFailures(c)
+		s.resetFailures(c)
 		return true
 	}
 	return false
 }
 
-func (m *Middleware) recordFailure(c *container) {
-	key := m.vmidKey(c)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.breakers[key] = time.Now()
+func (s *SharedState) recordFailure(c *container) {
+	key := s.vmidKey(c)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.breakers[key] = time.Now()
 }
 
-func (m *Middleware) resetFailures(c *container) {
-	key := m.vmidKey(c)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.breakers, key)
+func (s *SharedState) resetFailures(c *container) {
+	key := s.vmidKey(c)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.breakers, key)
 }
 
-func (m *Middleware) clearStarting(c *container) {
-	key := m.vmidKey(c)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.starting, key)
+func (s *SharedState) clearStarting(c *container) {
+	key := s.vmidKey(c)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.starting, key)
 }
 
-func (m *Middleware) setStartState(key, message, level string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if s, ok := m.starting[key]; ok {
-		s.message = message
-		s.level = level
+func (s *SharedState) setStartState(key, message, level string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.starting[key]; ok {
+		st.message = message
+		st.level = level
 	}
 }
 
-func (m *Middleware) getStartLock(key string) *tryLock {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if l, ok := m.startLocks[key]; ok {
+func (s *SharedState) getStartLock(key string) *tryLock {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if l, ok := s.startLocks[key]; ok {
 		return l
 	}
 	l := &tryLock{}
-	m.startLocks[key] = l
+	s.startLocks[key] = l
 	return l
 }
 
 // ensureStartCycle sends a start command for a stopped container (once per
 // request, guarded by the start lock and circuit breaker).
-func (m *Middleware) ensureStartCycle(c *container) {
-	key := m.vmidKey(c)
+func (s *SharedState) ensureStartCycle(c *container) {
+	key := s.vmidKey(c)
 
-	m.mu.Lock()
-	if _, ok := m.starting[key]; ok {
-		m.mu.Unlock()
+	s.mu.Lock()
+	if _, ok := s.starting[key]; ok {
+		s.mu.Unlock()
 		return
 	}
-	m.starting[key] = &startState{startedAt: time.Now(), message: "Container is stopped, starting now...", level: "info"}
-	m.mu.Unlock()
+	s.starting[key] = &startState{startedAt: time.Now(), message: "Container is stopped, starting now...", level: "info"}
+	s.mu.Unlock()
 
-	lock := m.getStartLock(key)
+	lock := s.getStartLock(key)
 	if !lock.try() {
 		return
 	}
 	defer lock.unlock()
 
-	if m.isRunning(c) {
-		m.setStartState(key, "Container is already running.", "info")
+	if s.isRunning(c) {
+		s.setStartState(key, "Container is already running.", "info")
 		return
 	}
 
-	m.mu.Lock()
-	if last, ok := m.breakers[key]; ok {
+	s.mu.Lock()
+	if last, ok := s.breakers[key]; ok {
 		if time.Since(last) < 300*time.Second {
-			m.mu.Unlock()
-			m.setStartState(key, "Recent start failures, waiting before retrying...", "error")
+			s.mu.Unlock()
+			s.setStartState(key, "Recent start failures, waiting before retrying...", "error")
 			return
 		}
-		delete(m.breakers, key)
+		delete(s.breakers, key)
 	}
-	m.mu.Unlock()
+	s.mu.Unlock()
 
-	if err := m.client.StartVM(context.Background(), m.nodeName, c.kind, c.vmid); err != nil {
-		m.mu.Lock()
-		m.breakers[key] = time.Now()
-		m.mu.Unlock()
-		m.setStartState(key, "Failed to start container: "+err.Error(), "error")
+	if err := s.client.StartVM(context.Background(), s.nodeName, c.kind, c.vmid); err != nil {
+		s.mu.Lock()
+		s.breakers[key] = time.Now()
+		s.mu.Unlock()
+		s.setStartState(key, "Failed to start container: "+err.Error(), "error")
 		log.Printf("wake-lxc: VMID %d: start failed: %v", c.vmid, err)
 	} else {
-		m.mu.Lock()
-		delete(m.breakers, key)
-		m.mu.Unlock()
-		m.setStartState(key, "Start command sent successfully.", "info")
+		s.mu.Lock()
+		delete(s.breakers, key)
+		s.mu.Unlock()
+		s.setStartState(key, "Start command sent successfully.", "info")
 		log.Printf("wake-lxc: VMID %d: start command sent", c.vmid)
 	}
 }
 
 // scheduleStop schedules a stop timer with the full duration (reschedule-on-access).
-func (m *Middleware) scheduleStop(c *container) {
-	key := m.vmidKey(c)
-	minutes, mode := internal.ResolveStop(c.labels, m.shutdownMinutes)
-	m.scheduleStopWithDelay(c, key, mode, time.Duration(minutes*float64(time.Minute)))
+func (s *SharedState) scheduleStop(c *container) {
+	key := s.vmidKey(c)
+	minutes, mode := internal.ResolveStop(c.labels, s.shutdownMinutes)
+	s.scheduleStopWithDelay(c, key, mode, time.Duration(minutes*float64(time.Minute)))
 }
 
-func (m *Middleware) scheduleStopWithDelay(c *container, key, mode string, delay time.Duration) {
-	ns := nodeStop(m.nodeName)
+func (s *SharedState) scheduleStopWithDelay(c *container, key, mode string, delay time.Duration) {
+	ns := nodeStop(s.nodeName)
 	stopState.Lock()
 	if t, ok := ns.timers[key]; ok {
 		t.Stop()
@@ -489,14 +478,14 @@ func (m *Middleware) scheduleStopWithDelay(c *container, key, mode string, delay
 
 	go func() {
 		<-timer.C
-		m.onStopTimer(c, key, mode, timer)
+		s.onStopTimer(c, key, mode, timer)
 	}()
 
-	m.saveState()
+	s.saveState()
 }
 
-func (m *Middleware) onStopTimer(c *container, key, mode string, timer *time.Timer) {
-	ns := nodeStop(m.nodeName)
+func (s *SharedState) onStopTimer(c *container, key, mode string, timer *time.Timer) {
+	ns := nodeStop(s.nodeName)
 	stopState.Lock()
 	if cur, ok := ns.timers[key]; ok && cur != timer {
 		stopState.Unlock()
@@ -507,11 +496,11 @@ func (m *Middleware) onStopTimer(c *container, key, mode string, timer *time.Tim
 	delay := ns.lastDelay[key]
 	stopState.Unlock()
 
-	m.saveState()
+	s.saveState()
 	log.Printf("wake-lxc: VMID %d: stop timer fired (scheduled: %.1f min)", c.vmid, delay.Minutes())
 
-	if m.isRunning(c) {
-		if err := m.client.StopVM(context.Background(), m.nodeName, c.kind, c.vmid, mode); err != nil {
+	if s.isRunning(c) {
+		if err := s.client.StopVM(context.Background(), s.nodeName, c.kind, c.vmid, mode); err != nil {
 			log.Printf("wake-lxc: VMID %d: shutdown failed: %v", c.vmid, err)
 		} else {
 			log.Printf("wake-lxc: VMID %d: shutdown command sent", c.vmid)
@@ -521,8 +510,8 @@ func (m *Middleware) onStopTimer(c *container, key, mode string, timer *time.Tim
 	}
 }
 
-func (m *Middleware) cancelStop(key string) {
-	ns := nodeStop(m.nodeName)
+func (s *SharedState) cancelStop(key string) {
+	ns := nodeStop(s.nodeName)
 	stopState.Lock()
 	if t, ok := ns.timers[key]; ok {
 		t.Stop()
@@ -530,42 +519,42 @@ func (m *Middleware) cancelStop(key string) {
 	}
 	delete(ns.deadlines, key)
 	stopState.Unlock()
-	m.saveState()
+	s.saveState()
 }
 
 // ensureWatchdog starts one watchdog goroutine per container. It self-
 // terminates when the stop timer is removed or the container stops externally.
-func (m *Middleware) ensureWatchdog(c *container) {
-	key := m.vmidKey(c)
-	m.mu.Lock()
-	if _, ok := m.watchdogs[key]; ok {
-		m.mu.Unlock()
+func (s *SharedState) ensureWatchdog(c *container) {
+	key := s.vmidKey(c)
+	s.mu.Lock()
+	if _, ok := s.watchdogs[key]; ok {
+		s.mu.Unlock()
 		return
 	}
-	m.watchdogs[key] = struct{}{}
-	m.mu.Unlock()
+	s.watchdogs[key] = struct{}{}
+	s.mu.Unlock()
 
 	go func() {
 		defer func() {
-			m.mu.Lock()
-			delete(m.watchdogs, key)
-			m.mu.Unlock()
+			s.mu.Lock()
+			delete(s.watchdogs, key)
+			s.mu.Unlock()
 		}()
-		ticker := time.NewTicker(m.checkInterval)
+		ticker := time.NewTicker(s.checkInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				ns := nodeStop(m.nodeName)
+				ns := nodeStop(s.nodeName)
 				stopState.Lock()
 				hasTimer := ns.timers[key] != nil
 				stopState.Unlock()
 				if !hasTimer {
 					return
 				}
-				if !m.isRunning(c) {
+				if !s.isRunning(c) {
 					log.Printf("wake-lxc: VMID %d: stopped externally, cancelling pending stop timer", c.vmid)
-					m.cancelStop(key)
+					s.cancelStop(key)
 					return
 				}
 			}
@@ -575,26 +564,26 @@ func (m *Middleware) ensureWatchdog(c *container) {
 
 // discover runs one discovery pass: lists LXC/QEMU, reads configs, resolves
 // wake labels, and swaps the domain/VMID maps.
-func (m *Middleware) discover(ctx context.Context) error {
-	ipamMap := m.getIPAMMap(ctx)
+func (s *SharedState) discover(ctx context.Context) error {
+	ipamMap := s.getIPAMMap(ctx)
 
 	domains := make(map[string]*container)
 	byVMID := make(map[uint64]*container)
 
-	lxcRefs, err := m.client.ListLXC(ctx, m.nodeName)
+	lxcRefs, err := s.client.ListLXC(ctx, s.nodeName)
 	if err != nil {
 		return err
 	}
 	for _, ref := range lxcRefs {
-		m.discoverOne(ctx, "lxc", ref, ipamMap, domains, byVMID)
+		s.discoverOne(ctx, "lxc", ref, ipamMap, domains, byVMID)
 	}
 
-	qemuRefs, err := m.client.ListQEMU(ctx, m.nodeName)
+	qemuRefs, err := s.client.ListQEMU(ctx, s.nodeName)
 	if err != nil {
 		return err
 	}
 	for _, ref := range qemuRefs {
-		m.discoverOne(ctx, "qemu", ref, ipamMap, domains, byVMID)
+		s.discoverOne(ctx, "qemu", ref, ipamMap, domains, byVMID)
 	}
 
 	// Detect label changes and membership changes against the package-level
@@ -602,7 +591,7 @@ func (m *Middleware) discover(ctx context.Context) error {
 	// baseline means no prior pass has run; that's initialization, not a
 	// change, so it's reported silently.
 	lastSeen.Lock()
-	prev := lastSeen.byNode[m.nodeName]
+	prev := lastSeen.byNode[s.nodeName]
 	hadBaseline := len(prev) > 0
 	var changed, added, removed []uint64
 	for vmid, newC := range byVMID {
@@ -628,13 +617,13 @@ func (m *Middleware) discover(ctx context.Context) error {
 			removed = append(removed, vmid)
 		}
 	}
-	lastSeen.byNode[m.nodeName] = byVMID
+	lastSeen.byNode[s.nodeName] = byVMID
 	lastSeen.Unlock()
 
-	m.mu.Lock()
-	m.domains = domains
-	m.byVMID = byVMID
-	m.mu.Unlock()
+	s.mu.Lock()
+	s.domains = domains
+	s.byVMID = byVMID
+	s.mu.Unlock()
 
 	// Log membership changes only when a prior baseline existed; silent on
 	// the first pass and when nothing changed.
@@ -647,20 +636,20 @@ func (m *Middleware) discover(ctx context.Context) error {
 	// must not arm a shutdown timer on a container that has no pending stop).
 	for _, vmid := range changed {
 		c := byVMID[vmid]
-		key := m.vmidKey(c)
-		ns := nodeStop(m.nodeName)
+		key := s.vmidKey(c)
+		ns := nodeStop(s.nodeName)
 		stopState.Lock()
 		hasTimer := ns.timers[key] != nil
 		stopState.Unlock()
 		if hasTimer {
-			m.scheduleStop(c)
+			s.scheduleStop(c)
 		}
 	}
 	return nil
 }
 
-func (m *Middleware) discoverOne(ctx context.Context, kind string, ref internal.VMRef, ipamMap map[string]string, domains map[string]*container, byVMID map[uint64]*container) {
-	cfg, err := m.client.GetVMConfig(ctx, m.nodeName, kind, ref.VMID)
+func (s *SharedState) discoverOne(ctx context.Context, kind string, ref internal.VMRef, ipamMap map[string]string, domains map[string]*container, byVMID map[uint64]*container) {
+	cfg, err := s.client.GetVMConfig(ctx, s.nodeName, kind, ref.VMID)
 	if err != nil {
 		log.Printf("wake-lxc: VMID %d: discovery check failed, skipping this pass: %v", ref.VMID, err)
 		return
@@ -670,7 +659,7 @@ func (m *Middleware) discoverOne(ctx context.Context, kind string, ref internal.
 		return
 	}
 	isLXC := kind == "lxc"
-	domain, err := internal.ResolveDomain(l, m.domainTemplate, cfg.Hostname, isLXC)
+	domain, err := internal.ResolveDomain(l, s.domainTemplate, cfg.Hostname, isLXC)
 	if err != nil {
 		log.Printf("wake-lxc: VMID %d: %v, skipping", ref.VMID, err)
 		return
@@ -689,16 +678,16 @@ func (m *Middleware) discoverOne(ctx context.Context, kind string, ref internal.
 }
 
 // getIPAMMap fetches the IPAM VMID→IP map once per discovery pass (30s TTL).
-func (m *Middleware) getIPAMMap(ctx context.Context) map[string]string {
-	m.mu.Lock()
-	if !m.ipamCacheAt.IsZero() && time.Since(m.ipamCacheAt) < 30*time.Second {
-		cached := m.ipamCache
-		m.mu.Unlock()
+func (s *SharedState) getIPAMMap(ctx context.Context) map[string]string {
+	s.mu.Lock()
+	if !s.ipamCacheAt.IsZero() && time.Since(s.ipamCacheAt) < 30*time.Second {
+		cached := s.ipamCache
+		s.mu.Unlock()
 		return cached
 	}
-	m.mu.Unlock()
+	s.mu.Unlock()
 
-	ipams, err := m.client.GetIPAMs(ctx)
+	ipams, err := s.client.GetIPAMs(ctx)
 	if err != nil {
 		log.Printf("wake-lxc: IPAM lookup failed: %v", err)
 		return nil
@@ -708,7 +697,7 @@ func (m *Middleware) getIPAMMap(ctx context.Context) map[string]string {
 		if ipam.IPAMID == "" {
 			continue
 		}
-		status, err := m.client.GetIPAMStatus(ctx, ipam.IPAMID)
+		status, err := s.client.GetIPAMStatus(ctx, ipam.IPAMID)
 		if err != nil {
 			log.Printf("wake-lxc: IPAM %s status failed: %v", ipam.IPAMID, err)
 			continue
@@ -717,20 +706,20 @@ func (m *Middleware) getIPAMMap(ctx context.Context) map[string]string {
 			result[strconv.FormatInt(int64(rec.VMID), 10)] = rec.IP
 		}
 	}
-	m.mu.Lock()
-	m.ipamCache = result
-	m.ipamCacheAt = time.Now()
-	m.mu.Unlock()
+	s.mu.Lock()
+	s.ipamCache = result
+	s.ipamCacheAt = time.Now()
+	s.mu.Unlock()
 	return result
 }
 
-func (m *Middleware) discoveryLoop(ctx context.Context) {
-	ticker := time.NewTicker(m.discoveryInterval)
+func (s *SharedState) discoveryLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.discoveryInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			if err := m.discover(ctx); err != nil {
+			if err := s.discover(ctx); err != nil {
 				log.Printf("wake-lxc: discovery loop failed: %v", err)
 			}
 		}
@@ -738,11 +727,11 @@ func (m *Middleware) discoveryLoop(ctx context.Context) {
 }
 
 // saveState atomically writes the deadlines map to the state file.
-func (m *Middleware) saveState() {
-	if m.stateFile == "" {
+func (s *SharedState) saveState() {
+	if s.stateFile == "" {
 		return
 	}
-	ns := nodeStop(m.nodeName)
+	ns := nodeStop(s.nodeName)
 	stopState.Lock()
 	deadlines := make(map[string]int64)
 	for k, d := range ns.deadlines {
@@ -759,20 +748,20 @@ func (m *Middleware) saveState() {
 		log.Printf("wake-lxc: failed to marshal state: %v", err)
 		return
 	}
-	tmp := m.stateFile + ".tmp"
+	tmp := s.stateFile + ".tmp"
 	if err := os.WriteFile(tmp, b, 0644); err != nil {
 		log.Printf("wake-lxc: failed to write state: %v", err)
 		return
 	}
-	if err := os.Rename(tmp, m.stateFile); err != nil {
+	if err := os.Rename(tmp, s.stateFile); err != nil {
 		log.Printf("wake-lxc: failed to rename state: %v", err)
 		return
 	}
 }
 
 // loadState resumes stop timers from the state file.
-func (m *Middleware) loadState(ctx context.Context) {
-	b, err := os.ReadFile(m.stateFile)
+func (s *SharedState) loadState(ctx context.Context) {
+	b, err := os.ReadFile(s.stateFile)
 	if err != nil {
 		return
 	}
@@ -790,29 +779,29 @@ func (m *Middleware) loadState(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		c, ok := m.byVMID[uint64(vmid)]
+		c, ok := s.byVMID[uint64(vmid)]
 		if !ok {
 			continue
 		}
 		deadline := time.Unix(deadlineUnix, 0)
 		remaining := deadline.Sub(now)
-		_, mode := internal.ResolveStop(c.labels, m.shutdownMinutes)
+		_, mode := internal.ResolveStop(c.labels, s.shutdownMinutes)
 		if remaining <= 0 {
 			log.Printf("wake-lxc: VMID %d: stop was overdue while offline, stopping now", c.vmid)
 			go func() {
-				if err := m.client.StopVM(ctx, m.nodeName, c.kind, c.vmid, mode); err != nil {
+				if err := s.client.StopVM(ctx, s.nodeName, c.kind, c.vmid, mode); err != nil {
 					log.Printf("wake-lxc: VMID %d: overdue stop failed: %v", c.vmid, err)
 				}
 			}()
 		} else {
 			log.Printf("wake-lxc: VMID %d: resuming stop timer, %.1f min remaining", c.vmid, remaining.Minutes())
-			m.scheduleStopWithDelay(c, m.vmidKey(c), mode, remaining)
+			s.scheduleStopWithDelay(c, s.vmidKey(c), mode, remaining)
 		}
-		m.ensureWatchdog(c)
+		s.ensureWatchdog(c)
 	}
 }
 
-func (m *Middleware) writeStatus(rw http.ResponseWriter, c *container) {
+func (s *SharedState) writeStatus(rw http.ResponseWriter, c *container) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.Header().Set("Cache-Control", "no-store")
 
@@ -822,22 +811,22 @@ func (m *Middleware) writeStatus(rw http.ResponseWriter, c *container) {
 		Level   string `json:"level"`
 	}
 
-	if !m.isRunning(c) {
-		key := m.vmidKey(c)
-		m.mu.Lock()
+	if !s.isRunning(c) {
+		key := s.vmidKey(c)
+		s.mu.Lock()
 		var msg, level string
-		if s, ok := m.starting[key]; ok {
-			msg, level = s.message, s.level
+		if st, ok := s.starting[key]; ok {
+			msg, level = st.message, st.level
 		} else {
 			msg, level = "Container is stopped, starting now...", "info"
 		}
-		m.mu.Unlock()
+		s.mu.Unlock()
 		resp.Ready = false
 		resp.Message = msg
 		resp.Level = level
 	} else {
 		if c.backend != "" {
-			if m.probeBackend(c.backend) {
+			if s.probeBackend(c.backend) {
 				resp.Ready = true
 				resp.Message = "Ready"
 				resp.Level = "info"
@@ -856,8 +845,8 @@ func (m *Middleware) writeStatus(rw http.ResponseWriter, c *container) {
 	json.NewEncoder(rw).Encode(resp)
 }
 
-func (m *Middleware) probeBackend(url string) bool {
-	resp, err := m.probeClient.Get(url)
+func (s *SharedState) probeBackend(url string) bool {
+	resp, err := s.probeClient.Get(url)
 	if err != nil {
 		return false
 	}

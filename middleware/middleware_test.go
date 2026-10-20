@@ -218,9 +218,9 @@ func TestDiscovery(t *testing.T) {
 	mw, srv := newTestMW(t, pve, &Config{})
 	defer srv.Close()
 
-	mw.mu.Lock()
-	c, ok := mw.domains["n8n.lan"]
-	mw.mu.Unlock()
+	mw.shared.mu.Lock()
+	c, ok := mw.shared.domains["n8n.lan"]
+	mw.shared.mu.Unlock()
 	if !ok {
 		t.Fatal("expected n8n.lan in domains")
 	}
@@ -400,22 +400,26 @@ func TestReloadReusesInstance(t *testing.T) {
 		t.Fatalf("second New: %v", err)
 	}
 
-	if mw1 != mw2 {
-		t.Fatal("expected the second New to reuse the first instance, got a different one")
+	// The SharedState must be reused (same discovery loop, watchdogs, etc.).
+	if mw1.shared != mw2.shared {
+		t.Fatal("expected the second New to reuse the SharedState, got a different one")
 	}
 
-	// The reused instance must route to the NEW next handler, not the old one.
+	// Each Middleware wrapper has its own next handler.
 	pve.setRunning()
 	req := httptest.NewRequest("GET", "http://n8n.lan/", nil)
 	req.Host = "n8n.lan"
-	rw := httptest.NewRecorder()
-	mw2.ServeHTTP(rw, req)
 
-	if backend1Hit {
-		t.Error("stale next handler from the first New was invoked")
+	rw1 := httptest.NewRecorder()
+	mw1.ServeHTTP(rw1, req)
+	rw2 := httptest.NewRecorder()
+	mw2.ServeHTTP(rw2, req)
+
+	if !backend1Hit {
+		t.Error("expected mw1 to route to backend1")
 	}
 	if !backend2Hit {
-		t.Error("expected the reused instance to route to the latest next handler")
+		t.Error("expected mw2 to route to backend2")
 	}
 }
 
@@ -436,10 +440,10 @@ func TestBreaker(t *testing.T) {
 	mw.ServeHTTP(rw, req)
 
 	// The starting map should have an error-level message.
-	mw.mu.Lock()
+	mw.shared.mu.Lock()
 	key := "100"
-	s, ok := mw.starting[key]
-	mw.mu.Unlock()
+	s, ok := mw.shared.starting[key]
+	mw.shared.mu.Unlock()
 	if !ok {
 		t.Fatal("expected starting entry")
 	}
@@ -448,9 +452,9 @@ func TestBreaker(t *testing.T) {
 	}
 
 	// Clear the starting map so the next request re-enters ensureStartCycle.
-	mw.mu.Lock()
-	delete(mw.starting, key)
-	mw.mu.Unlock()
+	mw.shared.mu.Lock()
+	delete(mw.shared.starting, key)
+	mw.shared.mu.Unlock()
 
 	// Second request: breaker gates the start.
 	req2 := httptest.NewRequest("GET", "http://n8n.lan/", nil)
@@ -458,9 +462,9 @@ func TestBreaker(t *testing.T) {
 	rw2 := httptest.NewRecorder()
 	mw.ServeHTTP(rw2, req2)
 
-	mw.mu.Lock()
-	s2, ok := mw.starting[key]
-	mw.mu.Unlock()
+	mw.shared.mu.Lock()
+	s2, ok := mw.shared.starting[key]
+	mw.shared.mu.Unlock()
 	if !ok {
 		t.Fatal("expected starting entry after breaker")
 	}
@@ -526,8 +530,8 @@ func TestDiscoveryLoopSurvivesCtxCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second New: %v", err)
 	}
-	if mw != mw2 {
-		t.Fatal("expected the second New to reuse the first instance")
+	if mw.shared != mw2.shared {
+		t.Fatal("expected the second New to reuse the SharedState")
 	}
 
 	// Give the discovery loop time to tick after the cancellation.
@@ -541,5 +545,82 @@ func TestDiscoveryLoopSurvivesCtxCancellation(t *testing.T) {
 	pve.mu.Unlock()
 	if after <= before {
 		t.Errorf("discoveryLoop stopped after ctx cancellation: listCalls before=%d after=%d", before, after)
+	}
+}
+
+// TestTwoRoutersIndependentNext verifies the per-router next handler fix:
+// two routers (different names) sharing the same apiEndpoint+nodeName must
+// each route to their own backend, not the other's. Before the fix, the
+// singleton registry shared one atomic.Value for next, so the last router to
+// reload would clobber the first's handler.
+func TestTwoRoutersIndependentNext(t *testing.T) {
+	pve := &fakePVE{
+		vmID:     100,
+		status:   "running",
+		desc:     "wake.enable=true\nwake.domain=n8n.lan\nwake.port=80\nwake.host=10.0.0.5",
+		hostname: "n8n",
+	}
+	pveServer := httptest.NewServer(pve)
+	defer pveServer.Close()
+
+	c := &Config{
+		ApiEndpoint:       pveServer.URL,
+		ApiTokenId:        "test",
+		ApiToken:          "tok",
+		ApiValidateSSL:    "true",
+		ApiLogging:        "info",
+		NodeName:          "two-router-node", // unique key
+		DiscoveryInterval: "1h",
+		CheckInterval:     "1h",
+		ShutdownMinutes:   "30",
+	}
+
+	router1Hit := false
+	router1Backend := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		router1Hit = true
+		rw.WriteHeader(200)
+		rw.Write([]byte("router1"))
+	})
+	mw1, err := New(context.Background(), router1Backend, c, "router-1")
+	if err != nil {
+		t.Fatalf("New router-1: %v", err)
+	}
+
+	router2Hit := false
+	router2Backend := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		router2Hit = true
+		rw.WriteHeader(200)
+		rw.Write([]byte("router2"))
+	})
+	mw2, err := New(context.Background(), router2Backend, c, "router-2")
+	if err != nil {
+		t.Fatalf("New router-2: %v", err)
+	}
+
+	// SharedState must be the same (one discovery loop, not two).
+	if mw1.shared != mw2.shared {
+		t.Fatal("expected both routers to share the same SharedState")
+	}
+
+	// Each router must route to its own backend.
+	req := httptest.NewRequest("GET", "http://n8n.lan/", nil)
+	req.Host = "n8n.lan"
+
+	rw1 := httptest.NewRecorder()
+	mw1.ServeHTTP(rw1, req)
+	if !router1Hit {
+		t.Error("router-1 did not route to its own backend")
+	}
+	if rw1.Body.String() != "router1" {
+		t.Errorf("router-1 body = %q, want router1", rw1.Body.String())
+	}
+
+	rw2 := httptest.NewRecorder()
+	mw2.ServeHTTP(rw2, req)
+	if !router2Hit {
+		t.Error("router-2 did not route to its own backend")
+	}
+	if rw2.Body.String() != "router2" {
+		t.Errorf("router-2 body = %q, want router2", rw2.Body.String())
 	}
 }
