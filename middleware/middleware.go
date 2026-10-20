@@ -52,12 +52,8 @@ func CreateConfig() *Config {
 // swapped via atomic.Value instead of being a plain field: ServeHTTP reads it
 // on every request without a lock, while a concurrent New call on a reload
 // may be replacing it from another instance of this plugin.
-type handlerBox struct {
-	handler http.Handler
-}
-
 type Middleware struct {
-	next    atomic.Value // holds handlerBox
+	next    atomic.Value // holds http.Handler
 	name    string
 	client  *internal.ProxmoxClient
 
@@ -265,7 +261,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (*
 	if existing, ok := instanceRegistry.byKey[key]; ok {
 		instanceRegistry.Unlock()
 
-		existing.next.Store(handlerBox{handler: next})
+		existing.next.Store(next)
 		existing.mu.Lock()
 		existing.name = name
 		existing.checkInterval = checkInterval
@@ -299,7 +295,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (*
 		ipamCache:         make(map[string]string),
 		probeClient:       &http.Client{Timeout: 2 * time.Second},
 	}
-	m.next.Store(handlerBox{handler: next})
+	m.next.Store(next)
 	// Register before the discovery pass so a concurrent New for the same
 	// key can never create a second instance.
 	instanceRegistry.Lock()
@@ -339,7 +335,7 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		m.clearStarting(c)
 		m.scheduleStop(c)
 		m.ensureWatchdog(c)
-		m.next.Load().(handlerBox).handler.ServeHTTP(rw, req)
+		m.next.Load().(http.Handler).ServeHTTP(rw, req)
 		return
 	}
 	m.ensureStartCycle(c)
