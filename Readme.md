@@ -1,72 +1,62 @@
 # Wake LXC — Traefik Middleware Plugin
 
-A Traefik middleware plugin that wakes idle Proxmox LXC containers and QEMU VMs on request, proxies the traffic to the backend, and stops the container after a configurable idle window. Stopped containers wake on the first request and sleep again after inactivity — no Docker, no separate process, no SSE.
+A Traefik middleware plugin that wakes idle Proxmox LXC containers and QEMU VMs on request, shows a starting page while they boot, and stops them after a configurable idle window. Stopped guests wake on the first request and sleep again after inactivity.
 
 ## Features
 
 - **Auto-Wake**: Starts a stopped container on the first request to its domain.
-- **Proxying**: Forwards the request to the container's backend while it's running.
-- **Starting page**: While a container boots, the client lands on a live progress page that polls for readiness and reloads when the app is up.
+- **Starting page**: While a container boots, the client lands on a progress page that reloads when the app is up.
+- **Auto-Stop**: Stops the container after an idle window (graceful `shutdown`, or hard `stop` via `wake.stop_minutes`).
 - **Auto-Discovery**: Containers opt in via `wake.*` labels in their Proxmox notes — no per-container config file.
-- **Persistent Timers**: Stop deadlines persist in `state.json` and resume after a restart.
-- **Watchdog & Circuit Breaker**: Cancels a pending stop if the container is stopped externally; gates repeated start attempts on API failure.
-- **Traefik Native**: Runs inside Traefik as a Go middleware plugin (Yaegi).
 
 ## How it works
 
 ```
-Request → Traefik router (Host rule) → wake-lxc middleware
-                                   ├→ container running → proxy to backend
-                                   └→ container stopped → start + serve starting page
+Request → Traefik router (Host rule)
+              └→ wake-lxc middleware (gate)
+                   ├─ running  → let request through → Traefik proxies to backend
+                   └─ stopped  → send start cmd → serve starting page
 ```
 
 1. Traefik routes the request to the `wake-lxc` middleware (via a `Host` rule per domain).
-2. The middleware matches the `Host` against discovered containers.
-3. If the container is stopped, the middleware sends a Proxmox start command and serves the starting page (which polls `__wake__/status` until ready, then reloads).
-4. If the container is running, the middleware proxies the request to the backend.
-5. A watchdog monitors the container and cancels a pending stop if it's stopped externally.
-6. An idle timer stops the container (graceful `shutdown`, or hard `stop` via `wake.stop_minutes`) after inactivity; deadlines persist in `state.json`.
+2. If the container is running, the middleware lets the request through — Traefik proxies it to the backend. If it's stopped, the middleware sends a Proxmox start command and serves the starting page (which polls `__wake__/status` until ready, then reloads).
+3. An idle timer stops the container after inactivity (graceful `shutdown`, or hard `stop` via `wake.stop_minutes`).
+
+A watchdog cancels a pending stop if the container is stopped externally; a circuit breaker gates repeated start attempts when the API is flaky.
 
 ## Prerequisites
 
-- Go (for building the plugin)
 - Proxmox VE (8.x)
-- Traefik v3 with the `traefik-iac` / plugin loader enabled
+- Traefik v3 with the plugin loader enabled
 - LXC/QEMU containers running your services
 
 ## Installation
 
-The plugin is a Go module. Traefik loads it via the plugin loader (Yaegi). Build it with:
+### Proxmox setup
 
-```bash
-go build ./...
+The middleware drives Proxmox with a dedicated API token. Create a service user and a scoped token — the `pveum` commands are in [`pve_commands.md`](pve_commands.md).
+
+- Base: `VM.Audit`, `VM.Monitor`, `VM.PowerMgmt`
+- Auto-discovery adds: `VM.Config.Options` (reads the notes where `wake.*` labels live)
+- IPAM backends add: `SDN.Audit`
+
+The token's `value` (shown once) and its ID go into `apiToken` / `apiTokenId` below.
+
+### Load the plugin (static config)
+
+Add to your Traefik static config (`traefik.yaml`):
+
+```yaml
+experimental:
+  plugins:
+    wake-lxc:
+      moduleName: github.com/Deulfi/wake_lxc_middleware
+      version: v0.1.0
 ```
 
-Or install it for the `yaegi_test` target (see `Makefile`):
+### Configure the middleware (dynamic config)
 
-```bash
-make yaegi_test
-```
-
-## Configuration
-
-The plugin is configured via the Traefik plugin config section. There is no separate config file — all per-container settings come from Proxmox notes (`wake.*` labels), and global settings come from the plugin config.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `apiEndpoint` | string | — | Proxmox API base URL (required) |
-| `apiTokenId` | string | — | API token ID (required) |
-| `apiToken` | string | — | API token value (required) |
-| `apiValidateSSL` | string | `true` | Verify Proxmox SSL certificate |
-| `apiLogging` | string | `info` | Log level (`info` or `debug`) |
-| `nodeName` | string | — | Proxmox node name (required) |
-| `discoveryInterval` | string | `60s` | Seconds between discovery passes |
-| `checkInterval` | string | `5m` | Watchdog poll interval |
-| `shutdownMinutes` | string | `30` | Idle timeout (minutes) before stop |
-| `domainTemplate` | string | — | Domain for discovered LXCs without `wake.domain`, e.g. `"{hostname}.sub.domain.name"` (LXC only) |
-| `stateFile` | string | — | Path to the stop-deadline persistence file |
-
-### Traefik plugin config
+Add a middleware to your Traefik dynamic config:
 
 ```yaml
 http:
@@ -83,6 +73,24 @@ http:
           checkInterval: "5m"
           discoveryInterval: "60s"
 ```
+
+## Configuration
+
+The middleware's global settings come from the plugin config above; per-container settings come from Proxmox notes (`wake.*` labels).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `apiEndpoint` | string | — | Proxmox API base URL (required) |
+| `apiTokenId` | string | — | API token ID (required) |
+| `apiToken` | string | — | API token value (required) |
+| `apiValidateSSL` | string | `true` | Verify Proxmox SSL certificate |
+| `apiLogging` | string | `info` | Log level (`info` or `debug`) |
+| `nodeName` | string | — | Proxmox node name (required) |
+| `discoveryInterval` | string | `60s` | Interval between discovery passes |
+| `checkInterval` | string | `5m` | Watchdog poll interval |
+| `shutdownMinutes` | string | `30` | Fallback idle timeout (minutes) before stop |
+| `domainTemplate` | string | — | Domain for discovered LXCs without `wake.domain`, e.g. `"{hostname}.sub.domain.name"` (LXC only) |
+| `stateFile` | string | — | Path to the stop-deadline persistence file |
 
 ## Per-container labels (Proxmox notes)
 
@@ -107,7 +115,7 @@ wake.shutdown_minutes=30
 
 ### Backend resolution order
 
-`wake.backend` → `wake.host`+`wake.port` → static `ip=` off net0 → SDN IPAM lookup by vmid (cached 30s) → no backend.
+`wake.backend` → `wake.host`+`wake.port` → static `ip=` off net0 → SDN IPAM lookup by vmid (cached 30s) → **no probe** (the container is treated as ready the moment it's running).
 
 ### Domain resolution order
 
@@ -132,11 +140,11 @@ http:
       url: "http://10.0.100.5:5678"
 ```
 
-The middleware proxies to the backend (the `url` in the service) when the container is running. When stopped, it serves the starting page.
+The middleware lets the request through to the backend (the `url` in the service) when the container is running. When stopped, it serves the starting page.
 
 ## State file
 
-Stop deadlines persist in `state.json` (path from `stateFile`). On restart, pending stops resume. The format is:
+`stateFile` is empty by default — with it unset, stop deadlines live only in memory and are **lost on a Traefik restart** (a pending stop simply doesn't resume). Set it to a path on a persistent volume to resume pending stops across restarts. The file is plain JSON:
 
 ```json
 {
@@ -152,6 +160,20 @@ Stop deadlines persist in `state.json` (path from `stateFile`). On restart, pend
 - **Watchdog cancels stop prematurely**: Increase `checkInterval` or ensure the container takes longer to boot than the interval.
 - **Circuit breaker open**: Check Proxmox API logs. The breaker resets after 5 minutes.
 - **Discovery finds no containers**: The token needs node-level `VM.Audit` + `VM.Config.Options`; IPAM backends additionally need `SDN.Audit`.
+
+## Building from source
+
+The plugin is a Go module. Build it with:
+
+```bash
+go build ./...
+```
+
+Or run the Yaegi test target (see `Makefile`):
+
+```bash
+make yaegi_test
+```
 
 ## License
 
