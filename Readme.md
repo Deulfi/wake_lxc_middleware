@@ -27,7 +27,7 @@ A watchdog cancels a pending stop if the container is stopped externally; a circ
 ## Prerequisites
 
 - Proxmox VE (8.x)
-- Traefik v3 with the plugin loader enabled
+- Traefik (v2 or v3) with the plugin loader enabled
 - LXC/QEMU containers running your services
 
 ## Installation
@@ -160,6 +160,7 @@ The middleware lets the request through to the backend (the `url` in the service
 - **Watchdog cancels stop prematurely**: Increase `checkInterval` or ensure the container takes longer to boot than the interval.
 - **Circuit breaker open**: Check Proxmox API logs. The breaker resets after 5 minutes.
 - **Discovery finds no containers**: The token needs node-level `VM.Audit` + `VM.Config.Options`; IPAM backends additionally need `SDN.Audit`.
+- **Changed `apiToken`/`apiEndpoint`/`discoveryInterval` but nothing happened**: Traefik calls this plugin's `New` again on every dynamic-config reload, but the middleware reuses its existing background instance (same `apiEndpoint`+`nodeName`) instead of restarting it, so an already-running Proxmox client and discovery ticker don't pick up those changes. `checkInterval`, `shutdownMinutes`, `domainTemplate`, and `stateFile` do hot-reload; a credential or `discoveryInterval` change needs a real Traefik restart.
 
 ## Building from source
 

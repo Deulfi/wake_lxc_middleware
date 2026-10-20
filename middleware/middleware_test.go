@@ -14,21 +14,25 @@ import (
 
 // fakePVE is a mutable fake Proxmox API.
 type fakePVE struct {
-	mu       sync.Mutex
-	status   string
-	started  bool
-	stopped  bool
-	stopMode string
-	desc     string
-	hostname string
-	net0     string
-	vmID     uint64
-	startErr bool
+	mu        sync.Mutex
+	status    string
+	started   bool
+	stopped   bool
+	stopMode  string
+	desc      string
+	hostname  string
+	net0      string
+	vmID      uint64
+	startErr  bool
+	listCalls int // counts /lxc and /qemu list calls (for discovery-loop liveness)
 }
 
 func (f *fakePVE) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	p := req.URL.Path
 	if strings.HasSuffix(p, "/lxc") && strings.Contains(p, "/nodes/") {
+		f.mu.Lock()
+		f.listCalls++
+		f.mu.Unlock()
 		writeJSON(rw, map[string]interface{}{
 			"data": []map[string]interface{}{
 				{"vmid": f.vmID, "name": "n8n", "status": f.status},
@@ -351,6 +355,70 @@ func TestStopTimer(t *testing.T) {
 	}
 }
 
+func TestReloadReusesInstance(t *testing.T) {
+	pve := &fakePVE{
+		vmID:     100,
+		status:   "stopped",
+		desc:     "wake.enable=true\nwake.domain=n8n.lan\nwake.port=80\nwake.host=10.0.0.5",
+		hostname: "n8n",
+	}
+	pveServer := httptest.NewServer(pve)
+	defer pveServer.Close()
+
+	c := &Config{
+		ApiEndpoint:       pveServer.URL,
+		ApiTokenId:        "test",
+		ApiToken:          "tok",
+		ApiValidateSSL:    "true",
+		ApiLogging:        "info",
+		NodeName:          "reload-test-node", // unique key so other tests can't collide with this one
+		DiscoveryInterval: "1h",
+		CheckInterval:     "1h",
+		ShutdownMinutes:   "30",
+	}
+
+	backend1Hit := false
+	backend1 := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		backend1Hit = true
+		rw.WriteHeader(200)
+	})
+	mw1, err := New(context.Background(), backend1, c, "wake-1")
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+
+	// Simulate a Traefik reload: New is called again for the same
+	// apiEndpoint+nodeName, with a new next handler (Traefik always builds a
+	// fresh chain) but the plugin's own config unchanged.
+	backend2Hit := false
+	backend2 := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		backend2Hit = true
+		rw.WriteHeader(200)
+	})
+	mw2, err := New(context.Background(), backend2, c, "wake-1")
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+
+	if mw1 != mw2 {
+		t.Fatal("expected the second New to reuse the first instance, got a different one")
+	}
+
+	// The reused instance must route to the NEW next handler, not the old one.
+	pve.setRunning()
+	req := httptest.NewRequest("GET", "http://n8n.lan/", nil)
+	req.Host = "n8n.lan"
+	rw := httptest.NewRecorder()
+	mw2.ServeHTTP(rw, req)
+
+	if backend1Hit {
+		t.Error("stale next handler from the first New was invoked")
+	}
+	if !backend2Hit {
+		t.Error("expected the reused instance to route to the latest next handler")
+	}
+}
+
 func TestBreaker(t *testing.T) {
 	pve := &fakePVE{
 		vmID:     100,
@@ -398,5 +466,80 @@ func TestBreaker(t *testing.T) {
 	}
 	if !strings.Contains(s2.message, "Recent start failures") {
 		t.Errorf("message = %q, want breaker message", s2.message)
+	}
+}
+
+// TestDiscoveryLoopSurvivesCtxCancellation verifies the v3 scenario:
+// Traefik v3 cancels the old ctx on reload (commit fadee5e87). The
+// discoveryLoop must not depend on that ctx — it uses
+// context.Background() and runs for the process lifetime.
+func TestDiscoveryLoopSurvivesCtxCancellation(t *testing.T) {
+	pve := &fakePVE{
+		vmID:     100,
+		status:   "stopped",
+		desc:     "wake.enable=true\nwake.domain=n8n.lan\nwake.port=80\nwake.host=10.0.0.5",
+		hostname: "n8n",
+	}
+	pveServer := httptest.NewServer(pve)
+	defer pveServer.Close()
+
+	c := &Config{
+		ApiEndpoint:       pveServer.URL,
+		ApiTokenId:        "test",
+		ApiToken:          "tok",
+		ApiValidateSSL:    "true",
+		ApiLogging:        "info",
+		NodeName:          "ctx-cancel-node", // unique registry key
+		DiscoveryInterval: "50ms",
+		CheckInterval:     "1h",
+		ShutdownMinutes:   "30",
+	}
+
+	// First New: simulates the initial Traefik startup.
+	ctx, cancel := context.WithCancel(context.Background())
+	backend := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(200)
+	})
+	mw, err := New(ctx, backend, c, "wake-ctx")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Let the discovery loop tick a few times.
+	time.Sleep(200 * time.Millisecond)
+	pve.mu.Lock()
+	before := pve.listCalls
+	pve.mu.Unlock()
+	if before == 0 {
+		t.Fatal("expected the discovery loop to have made list calls")
+	}
+
+	// Cancel the ctx: simulates Traefik v3 cancelling the old context on reload.
+	cancel()
+
+	// Second New: simulates the reload. The discoveryLoop must still be
+	// running (it uses context.Background(), not the Traefik ctx).
+	backend2 := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(200)
+	})
+	mw2, err := New(context.Background(), backend2, c, "wake-ctx")
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+	if mw != mw2 {
+		t.Fatal("expected the second New to reuse the first instance")
+	}
+
+	// Give the discovery loop time to tick after the cancellation.
+	time.Sleep(200 * time.Millisecond)
+
+	// The discoveryLoop must still be making API calls after the ctx was
+	// cancelled. If it had exited on ctx.Done() (the old bug), listCalls
+	// would not have increased.
+	pve.mu.Lock()
+	after := pve.listCalls
+	pve.mu.Unlock()
+	if after <= before {
+		t.Errorf("discoveryLoop stopped after ctx cancellation: listCalls before=%d after=%d", before, after)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Deulfi/wake_lxc_middleware/internal"
@@ -43,11 +44,18 @@ func CreateConfig() *Config {
 }
 
 // Middleware is the wake-lxc plugin middleware.
+//
+// A single Middleware instance is shared across every Traefik reload that
+// targets the same apiEndpoint+nodeName (see instanceRegistry below), so its
+// background goroutines (discoveryLoop, per-container watchdogs) are started
+// exactly once regardless of how often Traefik calls New. next is therefore
+// swapped via atomic.Value instead of being a plain field: ServeHTTP reads it
+// on every request without a lock, while a concurrent New call on a reload
+// may be replacing it from another instance of this plugin.
 type Middleware struct {
-	next    http.Handler
+	next    atomic.Value // holds http.Handler
 	name    string
 	client  *internal.ProxmoxClient
-	ctx     context.Context
 
 	nodeName          string
 	discoveryInterval time.Duration
@@ -150,9 +158,42 @@ func nodeStop(node string) *nodeStopState {
 	}
 	return ns
 }
-// New creates the middleware. It validates config, runs a first discovery
-// pass (error → log, don't fail), resumes the stop-timer state file, and
-// starts the background discovery loop.
+
+// instanceRegistry holds the one live Middleware per apiEndpoint+nodeName,
+// at package level so it survives Traefik re-instantiating the plugin.
+//
+// Without this, every New call (Traefik calls it on every dynamic-config
+// reload anywhere in the instance, not just changes to this middleware)
+// would start a brand new discoveryLoop goroutine and a fresh set of
+// per-container watchdogs. On Traefik v3 the old instance's ctx is
+// cancelled on reload so those goroutines exit cleanly; on Traefik v2 it is
+// not, so they leak forever, each one polling the Proxmox API on its own
+// schedule. Reusing the instance removes the dependency on that behavior
+// entirely — it is then correct on any Traefik version.
+//
+// Only next (the live handler chain) and the cheap, non-background-affecting
+// scalars (name, checkInterval, shutdownMinutes, domainTemplate, stateFile)
+// are refreshed on reuse. apiToken/apiEndpoint/apiValidateSSL/apiLogging and
+// discoveryInterval are intentionally NOT hot-swapped — changing Proxmox
+// credentials or the discovery interval still requires a real Traefik
+// restart to take effect, since the client and the discovery ticker are
+// already running. That's a deliberate trade-off to keep the reuse path
+// simple and race-free; document it if it surprises you.
+var instanceRegistry = struct {
+	sync.Mutex
+	byKey map[string]*Middleware
+}{byKey: make(map[string]*Middleware)}
+
+func registryKey(apiEndpoint, nodeName string) string {
+	return apiEndpoint + "|" + nodeName
+}
+
+// New creates (or reuses) the middleware. On the first call for a given
+// apiEndpoint+nodeName it validates config, runs a first discovery pass
+// (error → log, don't fail), resumes the stop-timer state file, and starts
+// the background discovery loop. On a later call for the same
+// apiEndpoint+nodeName (a Traefik reload) it reuses the existing instance
+// instead, so no new background goroutines are started.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (*Middleware, error) {
 	if config.ApiEndpoint == "" {
 		return nil, fmt.Errorf("apiEndpoint is required")
@@ -211,13 +252,34 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (*
 		shutdownMinutes = f
 	}
 
+	// Reuse an existing instance for this apiEndpoint+nodeName if one is
+	// already running (a Traefik reload, not a true process restart). This
+	// is what avoids starting a second discoveryLoop/watchdog set — see the
+	// instanceRegistry doc comment above.
+	key := registryKey(config.ApiEndpoint, config.NodeName)
+	instanceRegistry.Lock()
+	if existing, ok := instanceRegistry.byKey[key]; ok {
+		instanceRegistry.Unlock()
+
+		existing.next.Store(next)
+		existing.mu.Lock()
+		existing.name = name
+		existing.checkInterval = checkInterval
+		existing.shutdownMinutes = shutdownMinutes
+		existing.domainTemplate = config.DomainTemplate
+		existing.stateFile = config.StateFile
+		existing.mu.Unlock()
+
+		log.Printf("wake-lxc: reusing existing middleware instance for %s (reload, not a restart)", key)
+		return existing, nil
+	}
+	instanceRegistry.Unlock()
+
 	client := internal.NewProxmoxClient(config.ApiEndpoint, config.ApiTokenId, config.ApiToken, validateSSL, logLevel)
 
 	m := &Middleware{
-		next:              next,
 		name:              name,
 		client:            client,
-		ctx:               ctx,
 		nodeName:          config.NodeName,
 		discoveryInterval: discoveryInterval,
 		checkInterval:     checkInterval,
@@ -233,6 +295,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (*
 		ipamCache:         make(map[string]string),
 		probeClient:       &http.Client{Timeout: 2 * time.Second},
 	}
+	m.next.Store(next)
+	// Register before the discovery pass so a concurrent New for the same
+	// key can never create a second instance.
+	instanceRegistry.Lock()
+	instanceRegistry.byKey[key] = m
+	instanceRegistry.Unlock()
 
 	// First discovery pass (error → log, don't fail Traefik startup).
 	if err := m.discover(ctx); err != nil {
@@ -244,8 +312,9 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (*
 		m.loadState(ctx)
 	}
 
-	// Background discovery loop.
-	go m.discoveryLoop(ctx)
+	// Background discovery loop (process-lifetime; the Traefik ctx is only
+	// for the initial pass above so it can be cancelled during startup).
+	go m.discoveryLoop(context.Background())
 
 	return m, nil
 }
@@ -266,7 +335,7 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		m.clearStarting(c)
 		m.scheduleStop(c)
 		m.ensureWatchdog(c)
-		m.next.ServeHTTP(rw, req)
+		m.next.Load().(http.Handler).ServeHTTP(rw, req)
 		return
 	}
 	m.ensureStartCycle(c)
@@ -486,8 +555,6 @@ func (m *Middleware) ensureWatchdog(c *container) {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-m.ctx.Done():
-				return
 			case <-ticker.C:
 				ns := nodeStop(m.nodeName)
 				stopState.Lock()
@@ -662,8 +729,6 @@ func (m *Middleware) discoveryLoop(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
-			return
 		case <-ticker.C:
 			if err := m.discover(ctx); err != nil {
 				log.Printf("wake-lxc: discovery loop failed: %v", err)
